@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # php-fix: emergency mitigation for php2shell (CVE-2026-109618 / CVE-2026-109619)
-# Sets session.upload_progress.enabled = Off in every PHP install on the host.
+# Sets session.upload_progress.enabled = Off in every PHP install on the host, and
+# fatal_error_backtraces = Off on unpatched PHP 8.5 (the confirmed CVE-2026-109619 producer).
 #
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/ersinkoc/php-fix/main/install.sh | sudo bash
@@ -13,11 +14,11 @@
 #   ... | bash -s -- --probe=https://example.com/index.php   # check from outside that multipart is blocked
 #   ... | bash -s -- --user-ini=$HOME/public_html            # shared hosting, no root: write .user.ini
 #
-# This is a stopgap. The real fix is upgrading PHP to the patched release.
+# This is a stopgap. The real fix is upgrading PHP: 8.2.35 / 8.3.36 / 8.4.27 / 8.5.12 (21 Oct 2026).
 
 set -u
 
-VERSION="1.4.0"
+VERSION="1.5.0"
 DIRECTIVE="session.upload_progress.enabled"
 TS="$(date +%Y%m%d-%H%M%S)"
 MODE=fix
@@ -30,8 +31,8 @@ USERINI_DIR=""
 JSON=0
 
 # First release of each supported branch that contains the php2shell fix.
-# Filled in from the official advisory; empty = not published yet.
-PATCHED_VERSIONS=""
+# From GHSA-w8hw-w9fx-j79w / GHSA-6wmf-4rv5-p3rp (21 Oct 2026).
+PATCHED_VERSIONS="8.2.35 8.3.36 8.4.27 8.5.12"
 CVES="CVE-2026-109618|CVE-2026-109619"
 
 usage() {
@@ -101,7 +102,7 @@ err()  { printf "${R}[!!]${N} %s\n" "$(clean "$*")"; }
 # usage: for x in ${ARR[@]+"${ARR[@]}"}; do ...
 
 # ---------------------------------------------------------------------------
-# --waf-print: rules for the second path (multipart parser). Prints only.
+# --waf-print: rules for the multipart path (CVE-2026-109618). Prints only.
 # ---------------------------------------------------------------------------
 if [ "$MODE" = waf ]; then
   cat <<'EOF'
@@ -297,6 +298,23 @@ collect_bins() {
   done < <(find_fpm_bins)
 }
 
+# ini_val <binary> <cli|fpm> <directive>
+ini_val() {
+  if [ "$2" = cli ]; then "$1" -r "echo ini_get('$3');" 2>/dev/null
+  else "$1" -i 2>/dev/null | awk -F' => ' -v d="$3" '$1==d{print $2; exit}'; fi
+}
+# scan_dir <binary> <cli|fpm>: the binary's own conf.d (additional .ini dir), or nothing
+scan_dir() {
+  local d
+  if [ "$2" = cli ]; then d="$("$1" --ini 2>/dev/null | awk -F': *' '/^Scan for additional/ {print $2; exit}')"
+  else d="$("$1" -i 2>/dev/null | awk -F' => ' '$1=="Scan this dir for additional .ini files" {print $2; exit}')"; fi
+  d="${d%%:*}"; [ -d "$d" ] && echo "$d"
+}
+# PHP 8.5 only, default On: with it, a fatal error leaves stale backtrace state behind
+# (GHSA-6wmf-4rv5-p3rp, the confirmed mod_php RCE). Off only drops the backtrace from the message.
+FEB=fatal_error_backtraces
+FEB_INI=zz-php2shell.ini
+
 # major*100+minor of a version string, or empty
 branch_num() { local ma mi; IFS=. read -r ma mi _ <<< "$1"; case "$ma$mi" in *[!0-9]*|'') return ;; esac; echo $((ma*100+mi)); }
 is_off() { case "$(echo "$1" | tr 'A-Z' 'a-z')" in ''|0|off|false|no|none) return 0 ;; esac; return 1; }
@@ -452,7 +470,7 @@ classify() {
   if [ "$n" -lt 504 ]; then STATUS=LEGACY; MIT=impossible; NOTE="EOL, no patch, and the mitigation cannot apply (< 5.4). Upgrade PHP."
   elif [ -n "$fixed" ] && ver_ge "$ver" "$fixed"; then STATUS=PATCHED; NOTE=">= $fixed"
   elif [ -n "$b" ] && backported "$b"; then STATUS=PATCHED; NOTE="distro backport (CVE in package changelog)"
-  elif [ "$n" -lt 802 ]; then STATUS=EOL; NOTE="EOL branch, no official patch expected. Upgrade PHP."
+  elif [ "$n" -lt 802 ]; then STATUS=EOL; NOTE="EOL upstream: no php.net patch. Your vendor may backport it (RHEL, Ubuntu Pro, Debian LTS, TuxCare, CloudLinux); otherwise upgrade PHP."
   elif [ -n "$fixed" ]; then STATUS=UNPATCHED; NOTE="fixed in $fixed"
   else STATUS=UNKNOWN; NOTE="fixed versions not known to this php-fix version"
   fi
@@ -472,10 +490,12 @@ report() {
 
 if [ "$MODE" = check ]; then
   [ "$JSON" -eq 1 ] || info "php-fix $VERSION patch status (read-only)"
-  [ -z "$PATCHED_VERSIONS" ] && [ "$JSON" -eq 0 ] && info "Official fixed versions are not in this script yet; update php-fix after the advisory is out."
   UNPATCHED=0
   while IFS='|' read -r b sapi ver v; do
     classify "$ver" "$v" "$b"
+    if [ "$(branch_num "$ver")" = 805 ] && [ "$STATUS" != PATCHED ]; then
+      is_off "$(ini_val "$b" "$sapi" "$FEB")" && NOTE="$NOTE ${FEB} Off." || NOTE="$NOTE ${FEB} is On (confirmed RCE producer): run the fix."
+    fi
     report "$sapi" "$b" "$ver" "$STATUS" "$MIT" "$NOTE"
     [ "$STATUS" = PATCHED ] || UNPATCHED=1
   done < <(collect_bins)
@@ -509,6 +529,19 @@ if [ "$MODE" = check ]; then
   if [ -n "$held" ]; then
     UNPATCHED=1
     [ "$JSON" -eq 1 ] || err "Held / version-locked PHP packages will NOT be updated: $held"
+  fi
+
+  if [ "$UNPATCHED" -ne 0 ] && [ "$JSON" -eq 0 ]; then
+    info "Update PHP from your vendor, then restart every PHP worker (FPM, Apache, LiteSpeed):"
+    if command -v apt-get >/dev/null 2>&1; then
+      info "  apt-get update && apt-get install --only-upgrade \$(dpkg-query -W -f='\${binary:Package}\n' '*php*')"
+    elif command -v dnf >/dev/null 2>&1; then info "  dnf upgrade '*php*'"
+    elif command -v yum >/dev/null 2>&1; then info "  yum update '*php*'"
+    elif command -v apk >/dev/null 2>&1; then info "  apk upgrade"
+    fi
+    info "  Control panels: update PHP from the panel (cPanel EA4, Plesk, CloudLinux alt-php, DirectAdmin CustomBuild)."
+    info "  Docker: pull the fixed php image tag and rebuild; restarting the old container is not enough."
+    info "  Distro builds keep the old upstream number: check your distro's security tracker for the fixed package revision."
   fi
 
   if [ "$JSON" -eq 1 ]; then
@@ -655,6 +688,13 @@ if [ "$MODE" = audit ]; then
       < <(docker ps --format '{{.Names}} ({{.Image}})' 2>/dev/null | grep -i php)
   fi
 
+  # 14) Per-request INI overrides (context, not a finding): applied before request startup, so any
+  #     warning/deprecation they raise is a CVE-2026-109619 consumer. Move them to php.ini / the pool.
+  c="$(grep -rlsE '^[^#]*(fastcgi_param|SetEnv|ProxyFCGISetEnvIf|RequestHeader)[^#]*PHP_(ADMIN_)?VALUE' \
+       /etc/nginx /etc/apache2 /etc/httpd /usr/local/lsws/conf 2>/dev/null | head -20)"
+  [ -n "$c" ] && info "Web server config passes PHP_VALUE / PHP_ADMIN_VALUE to PHP (keep it free of deprecated / invalid values):" \
+    && echo "$c" | while read -r f; do info "  $f"; done
+
   echo
   if [ "$FINDINGS" -gt 0 ]; then err "$FINDINGS item(s) to review. Heuristic: confirm before acting."; exit 3; fi
   ok "Nothing suspicious found by these heuristics (that is not proof of a clean system)."
@@ -681,6 +721,11 @@ if [ "$MODE" = revert ]; then
     cp -p --no-dereference "$f" "$orig" && { ok "Restored: $orig"; CHANGED=$((CHANGED+1)); } \
       || { err "Could not restore: $orig"; FAILED=$((FAILED+1)); }
   done
+  while read -r c; do
+    [ -n "$c" ] && grep -q '^; php-fix:' "$c" || continue
+    if [ "$DRY_RUN" -eq 1 ]; then info "[dry-run] Would remove: $c"; continue; fi
+    rm -f "$c" && { ok "Removed: $c"; CHANGED=$((CHANGED+1)); }
+  done < <(find ${existing_roots[@]+"${existing_roots[@]}"} -xdev -type f -name "$FEB_INI" 2>/dev/null)
   for c in "${MODPHP_CONFS[@]}"; do
     [ -f "$c" ] && grep -q '^# php-fix:' "$c" || continue
     if [ "$DRY_RUN" -eq 1 ]; then info "[dry-run] Would remove: $c"; continue; fi
@@ -851,6 +896,26 @@ if [ -n "$MODPHP_CONF" ]; then
   fi
 fi
 
+# 4b) Unpatched PHP 8.5: fatal_error_backtraces = Off, as a php-fix drop-in in the
+#     binary's own conf.d (php.ini untouched; --revert removes it)
+FEB_BODY="; php-fix: php2shell (CVE-2026-109619) mitigation for unpatched PHP 8.5; delete after patching
+${FEB} = Off"
+while IFS='|' read -r b sapi ver v; do
+  [ "$(branch_num "$ver")" = 805 ] || continue
+  classify "$ver" "" "$b"; [ "$STATUS" = PATCHED ] && continue
+  d="$(scan_dir "$b" "$sapi")"
+  [ -n "$d" ] && [ -f "$d/$FEB_INI" ] && grep -q '^; php-fix:' "$d/$FEB_INI" && continue   # already written
+  is_off "$(ini_val "$b" "$sapi" "$FEB")" && continue
+  if [ -z "$d" ]; then
+    err "$b: no conf.d directory; set ${FEB} = Off in its php.ini yourself"; FAILED=$((FAILED+1)); continue
+  fi
+  f="$d/$FEB_INI"
+  if [ "$DRY_RUN" -eq 1 ]; then info "[dry-run] Would write ${FEB} = Off: $f"; continue; fi
+  if [ -e "$f" ] || [ -L "$f" ] || ! dir_safe "$f"; then err "Refusing to write: $f"; FAILED=$((FAILED+1)); continue; fi
+  printf '%s
+' "$FEB_BODY" > "$f" && { ok "Wrote ${FEB} = Off (PHP 8.5): $f"; CHANGED=$((CHANGED+1)); }     || { err "Could not write: $f"; FAILED=$((FAILED+1)); }
+done < <(collect_bins)
+
 # 5) Reload services
 reload_services
 
@@ -868,6 +933,13 @@ check_result() {
   fi
   if is_off "$v"; then ok "$b ($sapi $ver): Off"
   else err "$b ($sapi $ver): STILL ON ($v)"; FAILED=$((FAILED+1)); fi
+  if [ "$n" = 805 ] && [ "$DRY_RUN" -eq 0 ]; then
+    classify "$ver" "" "$b"
+    if [ "$STATUS" != PATCHED ]; then
+      if is_off "$(ini_val "$b" "$sapi" "$FEB")"; then ok "    ${FEB}: Off"
+      else err "    ${FEB}: STILL ON"; FAILED=$((FAILED+1)); fi
+    fi
+  fi
   if [ "$n" -lt 802 ]; then
     err "    EOL branch: an official patch is unlikely. Block/limit multipart POSTs at the proxy/WAF (see --waf-print) and plan an upgrade."
     EOL=1
@@ -909,4 +981,4 @@ fi
 echo -e "${G}DONE ✔ ${DIRECTIVE} = Off${N}"
 [ "$EOL" -eq 1 ] && err "EOL PHP versions found: they will likely get no patch. See the warnings above."
 echo "Next: run with --check after patching, and --audit to look for signs of compromise."
-echo "Reminder: this is a stopgap. Upgrade PHP to the patched release as soon as possible."
+echo "Reminder: this is a stopgap. Upgrade PHP to ${PATCHED_VERSIONS// / / } (or your distro's fixed build) now."

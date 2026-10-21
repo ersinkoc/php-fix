@@ -2,14 +2,24 @@
 
 [![CI](https://github.com/ersinkoc/php-fix/actions/workflows/ci.yml/badge.svg)](https://github.com/ersinkoc/php-fix/actions/workflows/ci.yml)
 
-One-line emergency mitigation for **php2shell** (**CVE-2026-109618** / **CVE-2026-109619**), the critical PHP RCE bugs (CVSS v4.0 9.2) announced for the out-of-band PHP release on **21 October 2026, 14:00 UTC**.
-
-It sets `session.upload_progress.enabled = Off` across every PHP installation on a Linux server: distro packages, control panels, multiple PHP versions, PHP-FPM pools and Apache mod_php. Then it verifies the result through both the CLI and FPM binaries. Read-only modes check patch status (`--check`), sweep for signs of compromise (`--audit`) and print WAF rules for the second attack path (`--waf-print`).
+One-line emergency mitigation for **php2shell** (**CVE-2026-109618** / **CVE-2026-109619**), two critical unauthenticated PHP RCE bugs (CVSS v4.0 9.2), for servers that can't be patched right away.
 
 > [!IMPORTANT]
-> **This is a stopgap, not a fix.** The PHP team's position is that *the only real mitigation is patching / upgrading PHP*.
-> The public root-cause analysis puts the bug in `php_session_rfc1867_callback` (`ext/session/session.c`). That is a heap use-after-free: the upload-progress handler caches raw zval pointers into HashTables that get freed when the session is re-decoded mid-request. Disabling upload progress removes that path.
-> However, reports say it **only closes one of the two suspected paths**. The multipart parser itself is still reachable by any `multipart/form-data` POST, and at least one researcher claims there is no working mitigation at all. Patch as soon as your distro or panel ships the fixed build.
+> **The fix is out. Update PHP first:** **8.5.12, 8.4.27, 8.3.36 and 8.2.35** (released 21 October 2026). Distro builds may keep the old upstream number with the fix backported, so check your distro's tracker. PHP 8.1 and older get no php.net fix.
+> The PHP team says updating is the only complete mitigation. This script is for the time until you can.
+
+It sets `session.upload_progress.enabled = Off` across every PHP installation on a Linux server: distro packages, control panels, multiple PHP versions, PHP-FPM pools and Apache mod_php. On **unpatched PHP 8.5** it also sets `fatal_error_backtraces = Off`. Then it verifies the result through the CLI and FPM binaries and every running FPM pool. Read-only modes check patch status against the fixed versions (`--check`), sweep for signs of compromise (`--audit`) and print WAF rules for the multipart path (`--waf-print`).
+
+## What the two bugs are (from the official advisories)
+
+| | [CVE-2026-109618](https://github.com/php/php-src/security/advisories/GHSA-w8hw-w9fx-j79w): RCE via OOM corruption | [CVE-2026-109619](https://github.com/php/php-src/security/advisories/GHSA-6wmf-4rv5-p3rp): RCE via stale global state |
+|---|---|---|
+| Bug | PHP leaves the request with `longjmp()` on out-of-memory while request memory is only partly initialized. Shutdown then trusts it. | Global state survives the request that owned it. A later request on the same worker reads it before startup resets it. |
+| How it's reached | Mainly **multipart parsing**: bodies without a usable length, unlimited headers per part, empty file fields and nested names exhaust `memory_limit` while staying under `post_max_size` | **Producer:** a fatal error or OOM (on 8.5, `fatal_error_backtraces`). **Consumer:** session upload progress, or a warning from a per-request INI override |
+| Confirmed against | Apache mod_php (full RCE). FPM, FrankenPHP and LSAPI are likely affected | mod_php, plus FPM via the upload-progress path |
+| What php-fix does | Nothing in PHP config can close it. Block multipart at the edge (`--waf-print`) | `session.upload_progress.enabled = Off`, plus `fatal_error_backtraces = Off` on PHP 8.5 |
+
+Neither setting is complete. They close the confirmed paths, not every variant. **Patch.**
 
 ## Quick start
 
@@ -22,7 +32,7 @@ curl -fsSL https://raw.githubusercontent.com/ersinkoc/php-fix/main/install.sh | 
 Piping `main` into `sudo bash` means trusting whatever is on `main` at that moment. For production, use a release instead. Every release is built by GitHub Actions and ships with a `SHA256SUMS` file and a signed [build provenance attestation](https://docs.github.com/actions/security-for-github-actions/using-artifact-attestations):
 
 ```bash
-V=v1.4.0
+V=v1.5.0
 curl -fsSLO https://github.com/ersinkoc/php-fix/releases/download/$V/install.sh
 curl -fsSLO https://github.com/ersinkoc/php-fix/releases/download/$V/SHA256SUMS
 sha256sum -c SHA256SUMS                                      # integrity
@@ -37,7 +47,7 @@ sudo bash install.sh
 | `sudo bash install.sh` | **Yes** (with backups) | Applies the mitigation, reloads services gracefully, verifies |
 | `... --dry-run` | No | Shows what the default mode would change |
 | `... --no-restart` | Yes, without reloads | Applies the changes but doesn't reload services; reload them yourself later |
-| `... --check` | No | **PATCHED** / **UNPATCHED** / **EOL, no patch** / unknown for every PHP binary, **every running FPM pool (live)** and **every running Docker container** (`docker exec php`). Also detects distro backports via the package changelog, and warns about held / version-locked PHP packages (`apt-mark hold`, `dnf versionlock`) that would silently skip the update |
+| `... --check` | No | **PATCHED** / **UNPATCHED** / **EOL, no patch** / unknown against 8.2.35 / 8.3.36 / 8.4.27 / 8.5.12 for every PHP binary, **every running FPM pool (live)** and **every running Docker container** (`docker exec php`). Also detects distro backports via the package changelog, and warns about held / version-locked PHP packages (`apt-mark hold`, `dnf versionlock`) that would silently skip the update |
 | `... --audit[=HOURS]` | No | Heuristic indicator-of-compromise sweep (default: last 48 h). Runs at lowest CPU/IO priority |
 | `... --waf-print` | No | Prints rules for the multipart path: ModSecurity, nginx, Apache, LiteSpeed/.htaccess, Caddy/FrankenPHP, HAProxy, Cloudflare |
 | `... --revert[=STAMP]` | **Yes** | Restores the backups of the last run (or of the run `STAMP`, e.g. `20261021-120000`) and removes the mod_php drop-in |
@@ -81,18 +91,19 @@ With curl, pass options like this: `curl -fsSL .../install.sh | sudo bash -s -- 
    - Each FPM binary runs `php-fpm -t` before and after the change. If a config that passed before fails afterwards, the pool files are restored on the spot.
 
    Control panels (cPanel, Plesk) may regenerate pool files later. Re-run the script after panel PHP changes. The php.ini setting stays in place either way.
-5. **Hardens Apache mod_php.** If mod_php is loaded, it drops in `zz-php2shell.conf` with `php_admin_flag session.upload_progress.enabled off`, which `.htaccess` cannot override.
+5. **PHP 8.5 only, unpatched builds only:** writes `zz-php2shell.ini` with `fatal_error_backtraces = Off` into that binary's own `conf.d`. It leaves `php.ini` untouched, and `--revert` removes the file. On 8.5 this setting defaults to On and is the confirmed CVE-2026-109619 producer. Turning it off only drops the backtrace from fatal error messages.
+6. **Hardens Apache mod_php.** If mod_php is loaded, it drops in `zz-php2shell.conf` with `php_admin_flag session.upload_progress.enabled off`, which `.htaccess` cannot override.
    - Debian / Ubuntu: `/etc/apache2/conf-available/` + `a2enconf`
    - RHEL family: `/etc/httpd/conf.d/`
    - cPanel EA4: `/etc/apache2/conf.d/`
-6. **Reloads services gracefully**: `php*-fpm`, `ea-php*`, `plesk-php*`, `apache2` / `httpd`, LiteSpeed.
-7. **Verifies at three levels:**
+7. **Reloads services gracefully**: `php*-fpm`, `ea-php*`, `plesk-php*`, `apache2` / `httpd`, LiteSpeed.
+8. **Verifies at three levels:**
    - every PHP **CLI** binary (`ini_get`)
    - every **php-fpm** binary (`php-fpm -i`), which catches an FPM that reads a different ini
    - **every running FPM pool, live over FastCGI.** The script speaks FastCGI to each pool's socket or port with a tiny built-in client, runs a one-line `ini_get` script from `/run`, and reads the value that pool really serves, pool overrides included. It needs no `cgi-fcgi` and puts no file in any web root. Chrooted or `open_basedir` pools are reported as "not verified".
-8. **Checks the PHP version** of every binary it finds:
+9. **Checks the PHP version** of every binary it finds:
    - **PHP < 5.4**: the setting doesn't exist there, but the multipart parser is still exposed. The script reports *NOT PROTECTED* and exits `2`.
-   - **PHP < 8.2 (EOL branches)**: these will most likely get no official patch. The script warns you to block or limit multipart POSTs at the proxy/WAF (`--waf-print`) and plan an upgrade.
+   - **PHP < 8.2 (EOL branches)**: php.net doesn't patch these. Your vendor might backport the fix (RHEL, Ubuntu Pro, Debian LTS, TuxCare, CloudLinux), and `--check` detects that from the package changelog. Otherwise, block or limit multipart at the proxy/WAF (`--waf-print`) and upgrade.
 
 ## `--audit`: what it looks at
 
@@ -146,6 +157,8 @@ The tests cover:
   - `--check --json` produces valid JSON
 - **`--probe`:** reports `0` (blocked) against Apache with the rule, and `1` (reaches PHP) without it
 - **`--user-ini`:** writes `.user.ini` as the site user, is idempotent, and is refused as root
+- **PHP 8.5 (stub binary):** `--check` flags `fatal_error_backtraces` On; the fix writes the `conf.d` drop-in only on unpatched 8.5, verifies it, is idempotent, and `--revert` removes it
+- **Fixed versions:** `--check` classifies real distro PHP as PATCHED / UNPATCHED / EOL (Debian trixie already ships 8.4.27)
 - **`--audit` and `--check`:**
   - `--audit` flags a planted webshell, a worker `SIGSEGV` log line, a PHP file in `/tmp`, a reverse-shell command line, and a multipart request answered with `502` in a `Content-Type`-logging access log
   - `--audit` output stays clean when file names carry terminal escapes (ESC, 8-bit and UTF-8 C1)
@@ -193,7 +206,7 @@ curl -fsSL https://raw.githubusercontent.com/ersinkoc/php-fix/main/install.sh | 
 - **Apache mod_php ignores `.user.ini`.** There, add `php_flag session.upload_progress.enabled off` to `.htaccess` instead, and load the site right after: under PHP-FPM that line causes a 500 error.
 - **No SSH at all?** Many panels have a php.ini / "PHP settings" editor. Set the same value there.
 - **Verify** with a temporary `<?php var_export(ini_get('session.upload_progress.enabled'));` file. It must print `'0'` or `''`. Delete the file afterwards.
-- **Ask your host to patch PHP.** This setting doesn't cover the second path.
+- **Ask your host to update PHP** to 8.2.35 / 8.3.36 / 8.4.27 / 8.5.12. This setting doesn't cover CVE-2026-109618.
 
 ## Verify from outside
 
@@ -205,9 +218,23 @@ curl -fsSL https://raw.githubusercontent.com/ersinkoc/php-fix/main/install.sh | 
 
 It compares a multipart POST, a multipart PUT and a mixed-case `Content-Type` against a normal urlencoded POST. Point it at a PHP route that isn't on your upload allowlist. For a deeper reachability test with before/after-patch baselines, see [php2shell-scan](https://github.com/0xrsydn/php2shell-scan).
 
-## The second path: blocking multipart before PHP
+## Updating PHP
 
-Disabling upload progress doesn't stop the multipart parser itself. For defense in depth until you patch, put a multipart filter in front of PHP. Run `--waf-print` for ready-made rules.
+`--check` prints the right command for your system. Typical commands:
+
+```bash
+# Debian / Ubuntu (distro packages or the ondrej/sury repositories)
+apt-get update && apt-get install --only-upgrade $(dpkg-query -W -f='${binary:Package}\n' '*php*')
+# RHEL / Alma / Rocky / Fedora / Remi / cPanel EA4
+dnf upgrade '*php*'        # or: yum update '*php*'
+# Docker: rebuild on the fixed official tag, e.g. php:8.4.27-fpm, php:8.3.36-apache
+```
+
+Then **restart every PHP worker**: PHP-FPM, Apache with mod_php, LiteSpeed lsphp. Old workers keep running the old code until they're replaced. Control panels (Plesk, CloudLinux alt-php, DirectAdmin CustomBuild) update PHP from their own updaters. Run `--check` afterwards.
+
+## Blocking multipart before PHP (CVE-2026-109618)
+
+The OOM bug is reached mainly through PHP's multipart parser, and no PHP setting closes it. The advisory recommends blocking multipart at the frontend if the application doesn't need it. Run `--waf-print` for ready-made rules.
 
 - **Match every method, not just POST.** PHP 8.4's `request_parse_body()` parses multipart on PUT and PATCH too.
 - **Match `multipart` anywhere in `Content-Type`, case-insensitively.** Don't anchor it to `^multipart/form-data`.
@@ -234,7 +261,10 @@ These come up a lot, but they don't stop php2shell:
 | `file_uploads = Off` | PHP still parses the multipart body and only skips the file parts |
 | `enable_post_data_reading = Off` | Breaks every normal form, and doesn't cover the explicit `request_parse_body()` parsing in PHP 8.4 |
 | `ini_set('session.upload_progress.enabled', 0)` | The setting is `PHP_INI_PERDIR`, and the body is parsed before your code runs |
-| `post_max_size`, `disable_functions`, maintenance mode | The parsing happens before any of these apply |
+| `disable_functions`, maintenance mode | The parsing happens before any of these apply |
+| `post_max_size` alone | A multipart body without a usable length can get past the check, and per-part headers blow up memory inside the limit. Keep it low anyway, and enforce body size at the proxy |
+| `RLIMIT_AS` / `RLIMIT_DATA` (`ulimit -v`) | **Makes it worse.** `mmap()` fails at the limit and takes the vulnerable `longjmp()` path |
+| `error_reporting`, `@`, `display_errors = Off` | Don't stop the CVE-2026-109619 diagnostic consumer: the warning is raised even if nothing shows or logs it |
 | Security plugins, framework middleware, CSRF checks | They run after PHP has already parsed the body |
 | Blocking the `PHPSESSID` cookie | Breaks sessions, misses custom session names, and doesn't stop the parser |
 | A firewall, HTTPS or new passwords | None of them tell you whether the interpreter is patched |
@@ -246,17 +276,34 @@ These come up a lot, but they don't stop php2shell:
 - **Windows / IIS**, and software that bundles its own `php.exe` / `php-cgi.exe`. Not supported.
 - **Old distros.** Ubuntu 20.04 has no PPA PHP builds, and no fix has been confirmed for it. Distro backports keep the upstream version number, so compare the package revision against your distro's security advisory (`--check` looks for the CVE ids in the package changelog).
 
+## Interim measures php-fix does NOT apply (decide yourself)
+
+The advisories list more measures. php-fix leaves them out because each one can take a server down or break apps:
+
+| Measure | From | Why it isn't automatic |
+|---|---|---|
+| `memory_limit = -1`, set with `php_admin_value` | 109618 | Removes the predictable per-request limit the exploit relies on. Still incomplete. **It also removes the only per-request memory cap,** so one runaway script can eat the host's RAM. Use it only with per-worker cgroup limits (`memory.max`). A cgroup shared by the master and its workers takes them all down together |
+| `pm.max_requests = 1` | 109619 | Stops worker reuse, so stale state doesn't reach the next request. Forks a process per request, which costs a lot of CPU |
+| Lower `max_input_nesting_level`, `max_input_vars`, `max_file_uploads` and `post_max_size` | 109618 | Breaks large forms and multi-file uploads, depending on the app |
+| Remove deprecated / invalid values from per-request INI overrides (`.htaccess` / Apache `php_value`, nginx `fastcgi_param PHP_VALUE`) | 109619 | Needs review of each site. `--audit` lists web server configs that pass `PHP_VALUE` |
+| Stop attacker-reachable fatal errors and timeouts | 109619 | Application work |
+
 ## Rollback
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/ersinkoc/php-fix/main/install.sh | sudo bash -s -- --revert
 ```
 
-This restores every file from the most recent run's backups, removes the mod_php drop-in and reloads services gracefully. Backup files are kept. Pass `--revert=20261021-120000` to restore a specific run, or add `--dry-run` to preview the revert first.
+This restores every file from the most recent run's backups, removes the mod_php and PHP 8.5 drop-ins and reloads services gracefully. Backup files are kept. Pass `--revert=20261021-120000` to restore a specific run, or add `--dry-run` to preview the revert first.
 
 ## After patching
 
-Run `--check` to confirm every PHP binary is on a fixed build. Once you're on the fixed PHP release, you can turn upload progress back on if your applications need it. If they don't, leaving it off reduces attack surface.
+Run `--check` to confirm every PHP binary, pool and container is on a fixed build. After that:
+
+- **Upload progress:** the advisory recommends leaving it off if you don't need it. Turn it back on only if an app draws upload progress bars from `$_SESSION`.
+- **PHP 8.5:** you can delete `zz-php2shell.ini` from `conf.d` once patched, or keep it.
+- **Edge multipart rules:** remove them, or keep the narrow ModSecurity rule.
+- Run `--audit`: patching doesn't remove a webshell that was planted before the update.
 
 ## Other tools and write-ups
 
@@ -269,17 +316,16 @@ Run `--check` to confirm every PHP binary is on a fixed build. Once you're on th
 | [Censys query gist](https://gist.github.com/silascutler/c7f04537a79ace89569f979d964af0f9) | Finding exposed PHP hosts |
 | [Vincent Schmalbach's write-up](https://www.vincentschmalbach.com/cve-2026-109618-and-cve-2026-109619-what-you-should-do-now/) | Container-tested rules for nginx, Apache, LiteSpeed, Caddy, FrankenPHP, HAProxy and Cloudflare, plus a list of what doesn't help |
 
-Timeline note: Sansec expects mass exploitation within minutes of the 14:00 UTC release, because the patch diff reveals the bug. Patch first, then run `--audit`.
-
-## Roadmap
-
-- Fill in the official fixed versions for `--check` as soon as the advisory is out
+Timeline note: the fix and advisories are public, so the patch diff now shows attackers where the bugs are. Expect mass exploitation. Patch first, then run `--audit`.
 
 ## References
 
-- [PHP-UP-2026: primary technical write-up (heap UAF in session upload progress)](https://jackalsyn.com/posts/php-up-2026.html)
-- [php-src GitHub security advisories](https://github.com/php/php-src/security/advisories)
-- [PHP news / release announcements](https://www.php.net/)
+- [PHP 8.5.12 / 8.4.27 / 8.3.36 / 8.2.35 release announcement](https://www.php.net/)
+- [GHSA-w8hw-w9fx-j79w / CVE-2026-109618: RCE via OOM corruption](https://github.com/php/php-src/security/advisories/GHSA-w8hw-w9fx-j79w)
+- [GHSA-6wmf-4rv5-p3rp / CVE-2026-109619: RCE via stale global state](https://github.com/php/php-src/security/advisories/GHSA-6wmf-4rv5-p3rp)
+- [Help Net Security: PHP2Shell patched](https://www.helpnetsecurity.com/2026/10/21/php2shell-php-vulnerabilities-patched-cve-2026-109618-cve-2026-109619/)
+- [Tenable FAQ](https://www.tenable.com/blog/php2shell-cve-2026-109618-cve-2026-109619-frequently-asked-questions-about-critical-php-remote)
+- [PHP-UP-2026: pre-release write-up (heap UAF in session upload progress)](https://jackalsyn.com/posts/php-up-2026.html)
 - [php2shell overview: SecureLayer7](https://blog.securelayer7.net/php-rce-cve-2026-109618-109619/)
 - [Disabling session.upload_progress before the php2shell patch lands](https://lilting.ch/en/articles/php2shell-session-upload-progress-uaf)
 - [Assessing and containing php2shell: DeXpose](https://www.dexpose.io/php2shell-php-rce-exposure-response/)

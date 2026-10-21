@@ -209,12 +209,38 @@ printf '#!/bin/sh\ncase "$2" in *PHP_VERSION*) echo 5.3.29;; *) echo;; esac\n' >
 bash $S --no-restart >/dev/null; expect_rc 2 $? "PHP < 5.4 exits 2"
 rm -f /usr/bin/php74 /usr/bin/php53
 
-echo "== --revert"
+echo "== --check knows the fixed versions"
+out="$(bash $S --check 2>&1)"
+echo "$out" | grep -Eq '(PATCHED|EOL), mitigation' && ! echo "$out" | grep -q 'fixed versions not known' && pass "--check classifies against the fixed versions" || fail "--check still unknown"
+
+echo "== stub PHP 8.5: fatal_error_backtraces"
+mkdir -p /etc/php85stub/conf.d
+cat > /usr/bin/php85 <<'STUB'
+#!/bin/sh
+case "$1$2" in
+  --ini*) echo "Scan for additional .ini files in: /etc/php85stub/conf.d" ;;
+  *PHP_VERSION*) echo "${STUB_VER:-8.5.11}" ;;
+  *fatal_error_backtraces*) [ -f /etc/php85stub/conf.d/zz-php2shell.ini ] && echo || echo 1 ;;
+  *) echo ;;
+esac
+STUB
+chmod +x /usr/bin/php85
+bash $S --check 2>&1 | grep -q 'php85 .*fatal_error_backtraces is On' && pass "--check flags fatal_error_backtraces On on 8.5" || fail "--check missed 8.5 backtraces"
+out="$(bash $S --no-restart)"; rc=$?
+[ "$rc" = 0 ] && grep -q '^fatal_error_backtraces = Off$' /etc/php85stub/conf.d/zz-php2shell.ini && pass "fix writes the 8.5 drop-in" || fail "8.5 drop-in not written (rc=$rc)"
+echo "$out" | grep -q 'fatal_error_backtraces: Off' && pass "fix verifies backtraces Off" || fail "backtraces not verified"
+bash $S --no-restart | grep -q 'Wrote fatal_error_backtraces' && fail "8.5 drop-in not idempotent" || pass "8.5 drop-in idempotent"
+rm -f /etc/php85stub/conf.d/zz-php2shell.ini
+STUB_VER=8.5.12 bash $S --no-restart >/dev/null
+[ -f /etc/php85stub/conf.d/zz-php2shell.ini ] && fail "drop-in written on patched 8.5" || pass "patched 8.5 left alone"
+bash $S --no-restart >/dev/null   # leave it in place for the --revert test
 bash $S --revert; expect_rc 0 $? "revert"
 same "$CLI_INI" /root/cli.ini.orig && pass "php.ini restored byte-for-byte" || fail "php.ini not restored"
 grep -q 'php_admin_flag' "$POOL2" && fail "locked pool not restored" || pass "locked pool restored"
 ls /etc/apache2/conf-available/zz-php2shell.conf /etc/apache2/conf-enabled/zz-php2shell.conf >/dev/null 2>&1 \
   && fail "mod_php conf still present" || pass "mod_php conf removed"
+[ -f /etc/php85stub/conf.d/zz-php2shell.ini ] && fail "8.5 drop-in not removed by revert" || pass "8.5 drop-in removed by revert"
+rm -rf /usr/bin/php85 /etc/php85stub
 [ "$MODPHP" = 1 ] && { apache2ctl -t >/dev/null 2>&1 && pass "apache config valid after revert" || fail "apache broken after revert"; }
 
 echo "== --user-ini (shared hosting, no root)"
