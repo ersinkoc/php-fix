@@ -15,7 +15,7 @@
 
 set -u
 
-VERSION="1.2.0"
+VERSION="1.2.1"
 DIRECTIVE="session.upload_progress.enabled"
 TS="$(date +%Y%m%d-%H%M%S)"
 MODE=fix
@@ -70,7 +70,14 @@ case "$REVERT_TS" in ''|[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]-[0-9][0-9][0-9]
 if [ -t 1 ]; then G='\033[0;32m'; Y='\033[1;33m'; R='\033[0;31m'; N='\033[0m'; else G=''; Y=''; R=''; N=''; fi
 # Messages carry file names, process args and log fields an attacker may control:
 # print them literally and strip control characters (no terminal escape / fake-line injection).
-clean() { printf '%s' "$*" | tr -d '\000-\010\012-\037\177'; }
+# Drops invalid UTF-8 (incl. lone 8-bit C1 bytes like 0x9B = CSI), UTF-8 encoded C1 (U+0080-U+009F),
+# then C0 controls and DEL. Without iconv, keep printable ASCII only.
+if command -v iconv >/dev/null 2>&1; then
+  clean() { printf '%s' "$*" | iconv -c -f UTF-8 -t UTF-8 2>/dev/null \
+    | LC_ALL=C sed 's/\xc2[\x80-\x9f]//g' | LC_ALL=C tr -d '\000-\010\012-\037\177'; }
+else
+  clean() { printf '%s' "$*" | LC_ALL=C tr -cd '\011\040-\176'; }
+fi
 ok()   { printf "${G}[OK]${N} %s\n" "$(clean "$*")"; }
 info() { printf "${Y}[..]${N} %s\n" "$(clean "$*")"; }
 err()  { printf "${R}[!!]${N} %s\n" "$(clean "$*")"; }

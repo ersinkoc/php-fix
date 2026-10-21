@@ -103,6 +103,14 @@ echo '<?php system($_GET["c"]);' > "$evil"
 out="$(bash $S --audit 2>&1)"
 printf '%s' "$out" | grep -q "$(printf '\033')\[2J" && fail "escape sequence reached the terminal" || pass "escape sequences stripped"
 rm -f "$evil"
+for c1 in '\233' '\302\233'; do   # 8-bit CSI and UTF-8 encoded CSI
+  evil="/var/www/html/$(printf "y${c1}2J")ü.php"
+  echo '<?php system($_GET["c"]);' > "$evil"
+  out="$(bash $S --audit 2>&1)"
+  printf '%s' "$out" | LC_ALL=C grep -q "$(printf "$c1")" && fail "C1 control ($c1) reached the terminal" || pass "C1 control ($c1) stripped"
+  printf '%s' "$out" | grep -q 'ü\.php' && pass "UTF-8 name kept readable" || fail "UTF-8 name mangled"
+  rm -f "$evil"
+done
 
 echo "== stub binaries: EOL and < 5.4"
 printf '#!/bin/sh\ncase "$2" in *PHP_VERSION*) echo 7.4.33;; *) echo;; esac\n' > /usr/bin/php74; chmod +x /usr/bin/php74
