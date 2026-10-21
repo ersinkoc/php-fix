@@ -35,7 +35,7 @@ curl -fsSL https://raw.githubusercontent.com/ersinkoc/php-fix/main/install.sh | 
 Piping `main` into `sudo bash` means trusting whatever is on `main` at that moment. For production, use a release instead. Every release is built by GitHub Actions and ships with a `SHA256SUMS` file and a signed [build provenance attestation](https://docs.github.com/actions/security-for-github-actions/using-artifact-attestations):
 
 ```bash
-V=v1.11.1
+V=v1.12.0
 curl -fsSLO https://github.com/ersinkoc/php-fix/releases/download/$V/install.sh
 curl -fsSLO https://github.com/ersinkoc/php-fix/releases/download/$V/SHA256SUMS
 sha256sum -c SHA256SUMS                                      # integrity
@@ -52,6 +52,7 @@ sudo bash install.sh
 | `... --no-restart` | Yes, without reloads | Applies the changes but doesn't reload services; reload them yourself later |
 | `... --check` | No | **PATCHED** / **UNPATCHED** / **EOL, no patch** / unknown against 8.2.35 / 8.3.36 / 8.4.27 / 8.5.12 for every PHP binary, **every running FPM pool (live)** and **every running Docker container** (`docker exec php`). Also detects distro backports via the package changelog, and warns about held / version-locked PHP packages (`apt-mark hold`, `dnf versionlock`) that would silently skip the update. **After updating:** flags workers still running the old (replaced) PHP, and prints the update + restart commands for each PHP source it finds (Plesk, cPanel, DirectAdmin, CloudLinux, Remi, sury / ondrej, LiteSpeed, Docker) |
 | `... --audit[=HOURS]` | No | Heuristic indicator-of-compromise sweep (default: last 48 h). Runs at lowest CPU/IO priority |
+| `... --interim` | No | Which [interim measures](#interim-measures-php-fix-does-not-apply-decide-yourself) are in effect, per FPM binary and **per running pool** (`memory_limit`, `post_max_size`, input limits, `file_uploads`, `display_errors`, `pm.max_requests`, cgroup memory cap, nginx / Apache body caps). Flags settings that make the OOM bug **easier** to reach: `RLIMIT_AS` / `RLIMIT_DATA` on PHP / web server processes, systemd `LimitAS=` / `LimitDATA=`, `ulimit -v` / `-d`, Apache `RLimitMEM` (exit 1) |
 | `... --waf-print` | No | Prints rules for the multipart path: ModSecurity, nginx, Apache, LiteSpeed/.htaccess, Caddy/FrankenPHP, HAProxy, Cloudflare |
 | `... --revert[=STAMP]` | **Yes** | Restores the backups of the last run (or of the run `STAMP`, e.g. `20261021-120000`) and removes the mod_php drop-in |
 | `... --probe=URL` | No (5 harmless HTTP requests) | **From outside:** does multipart (POST, PUT, mixed-case) still reach this PHP URL, or is it blocked at the edge? No root needed; run it from your laptop |
@@ -162,6 +163,7 @@ The tests cover:
 - **`--user-ini`:** writes `.user.ini` as the site user, is idempotent, and is refused as root
 - **PHP 8.5 (stub binary):** `--check` flags `fatal_error_backtraces` On; the fix writes the `conf.d` drop-in only on unpatched 8.5, verifies it, is idempotent, and `--revert` removes it
 - **Fixed versions:** `--check` classifies real distro PHP as PATCHED / UNPATCHED / EOL (Debian trixie ships 8.4.27; Ubuntu 24.04's backported 8.3.6 is detected from its changelog)
+- **`--interim`:** reads the interim settings from live FPM pools, flags a PHP process started with `RLIMIT_AS` (`prlimit --as`) and an Apache `RLimitMEM`, and exits 0 on a clean host
 - **cPanel EA4:** an ea-php74 package at release 19 is PATCHED, and an older release says `upgrade 'ea-php*'` (Debian / Ubuntu images, with a stub .deb)
 - **DirectAdmin:** a 7.4 binary built after CustomBuild's CVE patch is PATCHED, and an older one says `da build php`. Imunify360 rulesets older than 8.83 are flagged
 - **Ubuntu:** `--check` recognizes 24.04's `8.3.6-0ubuntu0.24.04.13` as fixed from the USN table, and reports a build older than the table entry as unpatched
@@ -229,7 +231,7 @@ It compares a multipart POST, a multipart PUT and a mixed-case `Content-Type` ag
 
 Control panels and several repositories ship **their own PHP builds**. `apt upgrade` / `dnf upgrade` doesn't touch Plesk's, cPanel's, DirectAdmin's or CloudLinux's PHP. One server can have several of these side by side. `--check` lists every PHP it finds, detects where each one comes from, and prints the update command for that source.
 
-### Where the fixed builds are (as of 21 October 2026, ~22:00 UTC)
+### Where the fixed builds are (as of 21 October 2026, ~22:30 UTC)
 
 This changes hour by hour. Check the vendor's page, then confirm with `--check`.
 
@@ -240,9 +242,9 @@ This changes hour by hour. Check the vendor's page, then confirm with `--check`.
 | **cPanel EA4** | `/opt/cpanel/ea-phpXY` | ✅ [EA4 25.91](https://docs.cpanel.net/changelogs/easyapache-4-change-log-25/): ea-php82–85 → 8.2.35 / 8.3.36 / 8.4.27 / 8.5.12. **ea-php74 / 80 / 81 backported at the same version**: `7.4.33-19`, `8.0.30-12`, `8.1.34-5` | `dnf upgrade 'ea-php*'` (`yum` on EL7, `apt` on Ubuntu), or `/scripts/upcp`. Then `/scripts/restartsrv_apache_php_fpm` |
 | **DirectAdmin CustomBuild** | `/usr/local/phpXY` (compiled) | ✅ new DA build on `current` and `stable`: 8.2–8.5 bumped, **7.4 / 8.0 / 8.1 patched at the same version number** (shown with `*`). ⏳ 7.3–5.6 later. 8.1 may fail to build on some systems | `da update && da build php`. PHP is not rebuilt automatically unless the CustomBuild cron is enabled |
 | **CloudLinux ea-php** (cPanel on CloudLinux) | `/opt/cpanel/ea-phpXY` | ✅ ea-php52–85 in stable since 21 Oct 20:55 UTC, with CloudLinux's own numbering, e.g. ea-php74 `7.4.33-18.elX.cloudlinux.13`, ea-php82 `8.2.34-2.elX.cloudlinux.1`. The upstream number stays old; `--check` goes by the changelog | `yum update 'ea-php*'`. Verify: `rpm -q --changelog ea-php74-php-cli \| grep -E 'CVE-2026-(109618\|109619)'` |
-| **CloudLinux alt-php** | `/opt/alt/phpXY` | 🔄 rolling out per OS ([status](https://cloudlinux.statuspage.io/)): alt-php74 / 80 / 81 on most OSes, alt-php84 on EL7–10, Ubuntu 18.04–26.04, Debian 10–13; alt-php83 on Debian 12 / 13. ⏳ alt-php82, alt-php85 and the rest (announced for the evening of 21 Oct) | `yum update 'alt-php*'` |
+| **CloudLinux alt-php** | `/opt/alt/phpXY` | ⏳ **CloudLinux 7 / 8 / 9: not fixed yet.** CloudLinux corrected its status at 21:59 UTC: the alt-php builds announced earlier went to the TuxCare ELS repository, not the CloudLinux repositories these servers use. ✅ CloudLinux 10: alt-php74 via TuxCare ELS. Keep the mitigation on ([status](https://cloudlinux.statuspage.io/)) | `yum update 'alt-php*'` once CloudLinux announces it |
 | **TuxCare ELS / ESU** | vendor repos | ✅ RHEL 7, Oracle Linux 6 / 7, CentOS 8.4 / 8.5 / Stream 8, Amazon Linux 2, AlmaLinux 9.2 / 9.8 ESU, Ubuntu 16.04–20.04 ELS, Alpine 3.18 ELS. ⏳ CloudLinux 7, Debian 10 / 11 ELS, CentOS 6 / 7, PHP for Windows | vendor update command |
-| **Imunify360** WAF (cPanel, Plesk, CloudLinux) | ModSecurity vendor rules | ✅ ruleset **8.83** blocks the public exploit shape on Apache (LiteSpeed: logs only); 8.84 / 8.85 followed, and scanning IPs get a CAPTCHA. Interim only | `imunify360-agent update --force modsec-rules`. `--check` reports the installed ruleset version |
+| **Imunify360** WAF (cPanel, Plesk, CloudLinux) | ModSecurity vendor rules | ✅ ruleset **8.83** blocks the public exploit shape on Apache; **8.84 / 8.85 also block on LiteSpeed**. Scanning IPs get a CAPTCHA. Interim only | `imunify360-agent update --force modsec-rules`. `--check` reports the installed ruleset version |
 | **Cloudflare** WAF | edge | ✅ temporary rules for the known exploit vectors, for all plans including Free. Only covers traffic that goes through Cloudflare; the CTO calls it "a STOPGAP only" | nothing to do; lock the origin to Cloudflare IPs, or the rules can be bypassed |
 | **Check Point** IPS / WAF | gateway | ✅ IPS protection CPAI-2026-15172 | set new critical protections to Prevent. TLS traffic must be inspected |
 | **packages.sury.org** (Debian 12/13, Ubuntu 22.04/24.04) | `/etc/php/X.Y` | ✅ 8.2–8.5 on amd64. ⏳ **arm64 still on the old builds** (checked 21:20 UTC: 8.2.34 / 8.3.35 / 8.4.26 / 8.5.11). `--check` warns on arm64 hosts | `apt-get install --only-upgrade 'php8.3*'`. On arm64, check `apt-cache policy php8.3` |
@@ -368,9 +370,29 @@ The advisories list more measures. php-fix leaves them out because each one can 
 |---|---|---|
 | `memory_limit = -1`, set with `php_admin_value` | 109618 | Removes the predictable per-request limit the exploit relies on. Still incomplete. **It also removes the only per-request memory cap,** so one runaway script can eat the host's RAM. Use it only with per-worker cgroup limits (`memory.max`). A cgroup shared by the master and its workers takes them all down together |
 | `pm.max_requests = 1` | 109619 | Stops worker reuse, so stale state doesn't reach the next request. Forks a process per request, which costs a lot of CPU |
-| Lower `max_input_nesting_level`, `max_input_vars`, `max_file_uploads` and `post_max_size` | 109618 | Breaks large forms and multi-file uploads, depending on the app |
+| Lower `max_input_nesting_level` (32), `max_input_vars` (1000), `max_file_uploads` (5), `max_multipart_body_parts` (200) and `post_max_size` (8M, 32M with uploads; `upload_max_filesize` below it) | 109618 | Breaks large forms and multi-file uploads, depending on the app. Values from [php2shell.uk](https://php2shell.uk/mitigations) |
+| `file_uploads = Off` | 109618 | Only for sites that take no uploads at all. Not the same as rejecting multipart at the web server, which stops PHP from parsing the body |
+| A cgroup memory cap for PHP (`systemctl edit php8.3-fpm`: `MemoryHigh=3G`, `MemoryMax=4G`; containers: `docker run --memory=4g`) | 109618 | Needed with `memory_limit = -1`. Sizing depends on the host. **Never** use `ulimit -v` / `-d`, systemd `LimitAS=` / `LimitDATA=` or Apache `RLimitMEM` instead: they make allocations fail inside PHP, which is the vulnerable path. `--interim` reports both |
+| `pm.max_requests = 50` (instead of 1) | 109619 | Cheaper middle ground: corrupted state survives at most 50 requests. No effect on single-request attacks |
 | Remove deprecated / invalid values from per-request INI overrides (`.htaccess` / Apache `php_value`, nginx `fastcgi_param PHP_VALUE`) | 109619 | Needs review of each site. `--audit` lists web server configs that pass `PHP_VALUE` |
 | Stop attacker-reachable fatal errors and timeouts | 109619 | Application work |
+
+Run `--interim` to see which of these are in effect on each running pool, not just in `php.ini`.
+
+### Reducing exposure beyond PHP settings
+
+The PHP team says ini settings won't save you. If patching has to wait, these cut the exposure itself. They come from the PHP team, CERT-EU and the write-ups linked below:
+
+- **Take it off the internet** for the time being. Admin panels, staging, phpMyAdmin and internal apps behind a VPN or an authenticating reverse proxy. CERT-EU and the UK NCSC advise taking unpatched internet-facing PHP offline.
+- **Serve a static maintenance page from the web server**, with PHP-FPM stopped. An in-app maintenance mode runs after PHP has already parsed the request.
+- **Allow only GET and HEAD** where a site doesn't need forms.
+- **Multipart only where uploads happen.** Reject `multipart/form-data` everywhere else (`--waf-print`), and keep body caps low (`client_max_body_size`, `LimitRequestBody`). Enforce limits on decoded bodies and on requests without `Content-Length` at the proxy.
+- **Put a CDN / WAF in front, and lock the origin** to its IP ranges so nobody can go around it.
+- **Contain a compromise:** one pool and one system user per site, web roots read-only to that user, no secrets readable that the site doesn't need, outbound traffic from web servers limited to what they really use (egress firewall), and SELinux / AppArmor in enforcing mode.
+- **`disable_functions`** for the shell-execution family (`exec`, `system`, `shell_exec`, `passthru`, `proc_open`, `popen`, `pcntl_exec`) on sites that don't need them. It raises the cost of a compromise; it doesn't stop the memory corruption.
+- **Ask your host** for a patch date if you're on managed or shared hosting, and check bundled PHP in vendor appliances, CI runners and local dev stacks.
+
+None of this needs php-fix. Undo it after patching (see the [checklist](#after-patching-checklist)).
 
 ## Rollback
 
@@ -451,6 +473,9 @@ Timeline note: the fix and advisories are public, so the patch diff now shows at
 - [RHSA-2026:87072: php:8.2 on RHEL 9](https://access.redhat.com/errata/RHSA-2026:87072)
 - [Red Hat bulletin RHSB-2026-013](https://access.redhat.com/security/vulnerabilities/RHSB-2026-013)
 - [Datadog Security Labs: detection, analysis and remediation](https://securitylabs.datadoghq.com/articles/php2shell-critical-vulnerabilities-in-php/)
+- [php2shell.uk: temporary mitigations with values](https://php2shell.uk/mitigations)
+- [flyingpenguin: PHP2Shell, ini won't save you](https://www.flyingpenguin.com/php2shell-ini-wont-save-you/)
+- [MVPS.net: temporary mitigations](https://www.mvps.net/docs/php2shell-temporary-mitigations-and-the-urgent-php-security-update)
 - [Cloudflare: php2shell WAF protection](https://blog.cloudflare.com/php-vulnerabilities-waf-protection/)
 - [php2shell.com: overview, signals and after-patch notes](https://www.php2shell.com/)
 - [Amazon Linux 2023 issue #1148](https://github.com/amazonlinux/amazon-linux-2023/issues/1148)
