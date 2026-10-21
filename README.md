@@ -22,7 +22,7 @@ curl -fsSL https://raw.githubusercontent.com/ersinkoc/php-fix/main/install.sh | 
 Piping `main` into `sudo bash` means trusting whatever is on `main` at that moment. For production, use a release instead. Every release is built by GitHub Actions and ships with a `SHA256SUMS` file and a signed [build provenance attestation](https://docs.github.com/actions/security-for-github-actions/using-artifact-attestations):
 
 ```bash
-V=v1.3.0
+V=v1.4.0
 curl -fsSLO https://github.com/ersinkoc/php-fix/releases/download/$V/install.sh
 curl -fsSLO https://github.com/ersinkoc/php-fix/releases/download/$V/SHA256SUMS
 sha256sum -c SHA256SUMS                                      # integrity
@@ -37,10 +37,13 @@ sudo bash install.sh
 | `sudo bash install.sh` | **Yes** (with backups) | Applies the mitigation, reloads services gracefully, verifies |
 | `... --dry-run` | No | Shows what the default mode would change |
 | `... --no-restart` | Yes, without reloads | Applies the changes but doesn't reload services; reload them yourself later |
-| `... --check` | No | Per binary: **PATCHED** / **UNPATCHED** / **EOL, no patch** / unknown. Also detects distro backports via the package changelog, and warns about held / version-locked PHP packages (`apt-mark hold`, `dnf versionlock`) that would silently skip the update |
+| `... --check` | No | **PATCHED** / **UNPATCHED** / **EOL, no patch** / unknown for every PHP binary, **every running FPM pool (live)** and **every running Docker container** (`docker exec php`). Also detects distro backports via the package changelog, and warns about held / version-locked PHP packages (`apt-mark hold`, `dnf versionlock`) that would silently skip the update |
 | `... --audit[=HOURS]` | No | Heuristic indicator-of-compromise sweep (default: last 48 h). Runs at lowest CPU/IO priority |
 | `... --waf-print` | No | Prints rules for the multipart path: ModSecurity, nginx, Apache, LiteSpeed/.htaccess, Caddy/FrankenPHP, HAProxy, Cloudflare |
 | `... --revert[=STAMP]` | **Yes** | Restores the backups of the last run (or of the run `STAMP`, e.g. `20261021-120000`) and removes the mod_php drop-in |
+| `... --probe=URL` | No (5 harmless HTTP requests) | **From outside:** does multipart (POST, PUT, mixed-case) still reach this PHP URL, or is it blocked at the edge? No root needed; run it from your laptop |
+| `... --user-ini=DIR` | Only `DIR/.user.ini` | **Shared hosting without root:** sets it in the site's `.user.ini` (PHP-FPM / CGI / LiteSpeed). Run as the site user |
+| `... --check --json` | No | Same as `--check`, as one JSON document for fleet tooling (Ansible, Salt, SIEM) |
 
 With curl, pass options like this: `curl -fsSL .../install.sh | sudo bash -s -- --check`
 
@@ -52,6 +55,8 @@ With curl, pass options like this: `curl -fsSL .../install.sh | sudo bash -s -- 
 | `1` | A step failed, or the setting is still On somewhere. `--check`: something is unpatched or its status is unknown |
 | `2` | A PHP **older than 5.4** was found. This mitigation **cannot** protect it |
 | `3` | `--audit` found items to review |
+
+`--probe` uses its own codes: `0` = multipart is blocked before PHP, `1` = it reaches the app, `2` = no answer.
 
 ## Safety: designed not to break servers
 
@@ -81,7 +86,10 @@ With curl, pass options like this: `curl -fsSL .../install.sh | sudo bash -s -- 
    - RHEL family: `/etc/httpd/conf.d/`
    - cPanel EA4: `/etc/apache2/conf.d/`
 6. **Reloads services gracefully**: `php*-fpm`, `ea-php*`, `plesk-php*`, `apache2` / `httpd`, LiteSpeed.
-7. **Verifies** with every PHP **CLI** binary (`ini_get`) and every **php-fpm** binary (`php-fpm -i`). Each loads its own `php.ini`, so an FPM that still reads a different, unpatched ini is caught.
+7. **Verifies at three levels:**
+   - every PHP **CLI** binary (`ini_get`)
+   - every **php-fpm** binary (`php-fpm -i`), which catches an FPM that reads a different ini
+   - **every running FPM pool, live over FastCGI.** The script speaks FastCGI to each pool's socket or port with a tiny built-in client, runs a one-line `ini_get` script from `/run`, and reads the value that pool really serves, pool overrides included. It needs no `cgi-fcgi` and puts no file in any web root. Chrooted or `open_basedir` pools are reported as "not verified".
 8. **Checks the PHP version** of every binary it finds:
    - **PHP < 5.4**: the setting doesn't exist there, but the multipart parser is still exposed. The script reports *NOT PROTECTED* and exits `2`.
    - **PHP < 8.2 (EOL branches)**: these will most likely get no official patch. The script warns you to block or limit multipart POSTs at the proxy/WAF (`--waf-print`) and plan an upgrade.
@@ -97,6 +105,7 @@ This is a heuristic sweep, not proof either way. Every finding needs a human to 
 - Session files containing `upload_progress_` data, meaning the vulnerable code path was exercised
 - Recently changed cron jobs
 - Busiest POST-to-`.php` clients in the current access logs (context only)
+- If your access logs record `Content-Type` (see the logging snippets in `--waf-print`): the top multipart senders, and every **multipart request answered with 500–504**. A worker crashing under multipart is the strongest exploitation signal you can get from logs.
 - **PHP / web worker crashes** (`SIGSEGV`, `exited on signal 11`, kernel `segfault at … php-fpm`) in FPM and Apache logs and the kernel log. Memory-corruption exploits usually crash workers while they are being tuned.
 - PHP files dropped in `/tmp`, `/var/tmp` or `/dev/shm`
 - Reverse-shell command lines on any process (`/dev/tcp/`, `mkfifo … nc`, `nc -e`, `bash -i`, `socat … exec`, `fsockopen`, `pty.spawn`)
@@ -127,12 +136,18 @@ The tests cover:
 - **Can it be re-enabled?** Each test is a real HTTP request that returns `'0'`:
   - **mod_php:** a `.htaccess` with `php_flag … on` cannot turn it back on
   - **nginx + PHP-FPM:** a `.user.ini` with `On` cannot turn it back on
-- **`--waf-print` rules, run in real Apache and nginx** (configtest passes in both):
+- **`--waf-print` rules, run in real Apache and nginx** (configtest passes in both, including the logging snippets):
   - multipart POST, multipart **PUT** and a mixed-case `Content-Type` get `403`, as does the prefix trick `/wp-admin/async-upload.php-evil.php`
   - the allowlisted path, urlencoded POSTs and JSON POSTs pass
   - on Apache: a subfolder `.htaccess` with `RewriteEngine On` + `Require all granted` cannot bypass the rule, and neither can a vhost with its own rewrite rules
+- **Live pool verification:**
+  - `--check` and the fix itself read the live value from running FPM pools over FastCGI, over a unix socket and over TCP
+  - a pool added later with `php_admin_value[…] = 1` is reported as mitigation off
+  - `--check --json` produces valid JSON
+- **`--probe`:** reports `0` (blocked) against Apache with the rule, and `1` (reaches PHP) without it
+- **`--user-ini`:** writes `.user.ini` as the site user, is idempotent, and is refused as root
 - **`--audit` and `--check`:**
-  - `--audit` flags a planted webshell, a worker `SIGSEGV` log line, a PHP file in `/tmp` and a reverse-shell command line
+  - `--audit` flags a planted webshell, a worker `SIGSEGV` log line, a PHP file in `/tmp`, a reverse-shell command line, and a multipart request answered with `502` in a `Content-Type`-logging access log
   - `--audit` output stays clean when file names carry terminal escapes (ESC, 8-bit and UTF-8 C1)
   - `--check` runs; the EOL warning and the `< 5.4` exit `2` path are tested with stub binaries
 
@@ -166,6 +181,30 @@ php-fpm8.3 -i | grep session.upload_progress.enabled   # FPM's php.ini (adjust b
 
 For the real web SAPI, including FPM pool settings, put `<?php var_export(ini_get('session.upload_progress.enabled'));` in a temporary file and open it in a browser. `''` or `'0'` means Off. **Delete the file afterwards.**
 
+## Shared hosting (no root)
+
+If you only have SSH or FTP access to your own site:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/ersinkoc/php-fix/main/install.sh | bash -s -- --user-ini=$HOME/public_html
+```
+
+- **PHP-FPM / CGI / LiteSpeed:** this writes `session.upload_progress.enabled = 0` into `.user.ini` with a backup. PHP picks it up within 5 minutes (`user_ini.cache_ttl`).
+- **Apache mod_php ignores `.user.ini`.** There, add `php_flag session.upload_progress.enabled off` to `.htaccess` instead, and load the site right after: under PHP-FPM that line causes a 500 error.
+- **No SSH at all?** Many panels have a php.ini / "PHP settings" editor. Set the same value there.
+- **Verify** with a temporary `<?php var_export(ini_get('session.upload_progress.enabled'));` file. It must print `'0'` or `''`. Delete the file afterwards.
+- **Ask your host to patch PHP.** This setting doesn't cover the second path.
+
+## Verify from outside
+
+After adding edge rules, check them from another machine. The test needs no root and sends no exploit payload:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/ersinkoc/php-fix/main/install.sh | bash -s -- --probe=https://example.com/index.php
+```
+
+It compares a multipart POST, a multipart PUT and a mixed-case `Content-Type` against a normal urlencoded POST. Point it at a PHP route that isn't on your upload allowlist. For a deeper reachability test with before/after-patch baselines, see [php2shell-scan](https://github.com/0xrsydn/php2shell-scan).
+
 ## The second path: blocking multipart before PHP
 
 Disabling upload progress doesn't stop the multipart parser itself. For defense in depth until you patch, put a multipart filter in front of PHP. Run `--waf-print` for ready-made rules.
@@ -176,6 +215,7 @@ Disabling upload progress doesn't stop the multipart parser itself. For defense 
 - **Apache:** use the server-wide `<Location "/"> <If …> Require all denied` version. A bare top-level `<If>` or a `.htaccess` rewrite can be overridden by a subfolder `.htaccess`. We tested both bypasses.
 - **nginx:** put the guard at `server {}` level, so every route that ends up in PHP is covered.
 - **CDN / WAF:** it only protects traffic that goes through it. Restrict the origin to the CDN's IP ranges, or direct-to-IP requests skip it.
+- **Log `Content-Type`.** Default access logs don't record it, so multipart probing is invisible. `--waf-print` includes nginx `log_format` and Apache `LogFormat` snippets, and `--audit` uses them.
 - **Know what you'll break:** file uploads, `FormData`/AJAX forms, Contact Form 7 (multipart even without files) and Livewire/Filament uploads stop working outside the allowlist.
 - The narrow ModSecurity rule, which blocks only the `PHP_SESSION_UPLOAD_PROGRESS` field, is safe for almost every site. ModSecurity's multipart parser isn't PHP's, though, so treat it as a filter, not a guarantee.
 
@@ -234,7 +274,6 @@ Timeline note: Sansec expects mass exploitation within minutes of the 14:00 UTC 
 ## Roadmap
 
 - Fill in the official fixed versions for `--check` as soon as the advisory is out
-- `--json` output for fleet tooling (Ansible / Salt)
 
 ## References
 

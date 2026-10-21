@@ -10,12 +10,14 @@
 #   ... | sudo bash -s -- --audit        # read-only: quick indicator-of-compromise sweep
 #   ... | bash -s -- --waf-print         # print WAF / proxy rules for the multipart path, change nothing
 #   ... | sudo bash -s -- --revert       # restore the backups of the last run
+#   ... | bash -s -- --probe=https://example.com/index.php   # check from outside that multipart is blocked
+#   ... | bash -s -- --user-ini=$HOME/public_html            # shared hosting, no root: write .user.ini
 #
 # This is a stopgap. The real fix is upgrading PHP to the patched release.
 
 set -u
 
-VERSION="1.3.0"
+VERSION="1.4.0"
 DIRECTIVE="session.upload_progress.enabled"
 TS="$(date +%Y%m%d-%H%M%S)"
 MODE=fix
@@ -23,6 +25,9 @@ DRY_RUN=0
 NO_RESTART=0
 REVERT_TS=""
 AUDIT_HOURS=48
+PROBE_URL=""
+USERINI_DIR=""
+JSON=0
 
 # First release of each supported branch that contains the php2shell fix.
 # Filled in from the official advisory; empty = not published yet.
@@ -40,10 +45,13 @@ Modes (default: apply the mitigation):
   --audit[=HOURS]    Read-only. Quick indicator-of-compromise sweep (default: last 48 h).
   --waf-print        Print WAF / proxy rules for the multipart path. Changes nothing.
   --revert[=STAMP]   Restore the backups of the last run (or of run STAMP, e.g. 20261021-120000).
+  --probe=URL        From outside: does multipart still reach this PHP URL? (5 harmless requests)
+  --user-ini=DIR     Shared hosting without root: set it in DIR/.user.ini (PHP-FPM / CGI / LiteSpeed).
 
 Options:
   --dry-run          Show what would change, change nothing (fix / revert).
   --no-restart       Do not reload PHP / web services (fix / revert).
+  --json             Machine-readable output (check).
   -h, --help         Show this help.
 EOF
 }
@@ -58,6 +66,9 @@ for arg in "$@"; do
     --waf-print)  MODE=waf ;;
     --revert)     MODE=revert ;;
     --revert=*)   MODE=revert; REVERT_TS="${arg#*=}" ;;
+    --probe=*)    MODE=probe; PROBE_URL="${arg#*=}" ;;
+    --user-ini=*) MODE=userini; USERINI_DIR="${arg#*=}" ;;
+    --json)       JSON=1 ;;
     -h|--help)    usage; exit 0 ;;
     *) echo "Unknown option: $arg"; usage; exit 1 ;;
   esac
@@ -66,6 +77,8 @@ done
 case "$AUDIT_HOURS" in ''|*[!0-9]*) echo "--audit expects a number of hours"; exit 1 ;; esac
 case "$REVERT_TS" in ''|[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]-[0-9][0-9][0-9][0-9][0-9][0-9]) ;;
   *) echo "--revert expects a stamp like 20261021-120000"; exit 1 ;; esac
+case "$MODE:$PROBE_URL" in probe:http://?*|probe:https://?*|[!p]*) ;; *) echo "--probe expects an http(s) URL"; exit 1 ;; esac
+[ "$MODE" = userini ] && [ ! -d "$USERINI_DIR" ] && { echo "--user-ini expects an existing directory"; exit 1; }
 
 if [ -t 1 ]; then G='\033[0;32m'; Y='\033[1;33m'; R='\033[0;31m'; N='\033[0m'; else G=''; Y=''; R=''; N=''; fi
 # Messages carry file names, process args and log fields an attacker may control:
@@ -168,6 +181,15 @@ http-request deny if php2shell_mp !php2shell_ok
 # (any(lower(http.request.headers["content-type"][*])[*] contains "multipart")
 #  and not http.request.uri.path in {"/wp-admin/async-upload.php" "/wp-admin/media-new.php"})
 # IP Access "Allow" rules skip custom rules. Restrict the origin to Cloudflare IP ranges.
+
+############ Logging: record Content-Type so multipart traffic is visible ############
+# Default access logs don't contain Content-Type, so multipart probing is invisible.
+# These keep the "combined" layout and append ct="..."; `--audit` then reports multipart senders.
+# nginx (http {} context; then use `access_log /var/log/nginx/access.log php2shell;`):
+log_format php2shell '$remote_addr - $remote_user [$time_local] "$request" $status $body_bytes_sent '
+                     '"$http_referer" "$http_user_agent" ct="$http_content_type"';
+# Apache (then `CustomLog ${APACHE_LOG_DIR}/access.log php2shell` in each vhost):
+LogFormat "%h %l %u %t \"%r\" %>s %O \"%{Referer}i\" \"%{User-Agent}i\" ct=\"%{Content-Type}i\"" php2shell
 EOF
   exit 0
 fi
@@ -294,38 +316,208 @@ backported() {
 }
 
 # ---------------------------------------------------------------------------
+# Real SAPI check: ask every running PHP-FPM pool over FastCGI what it sees
+# (php.ini + pool php_admin_* overrides), without curl, cgi-fcgi or files in a web root.
+# ---------------------------------------------------------------------------
+FCGI_CLIENT='<?php
+$a = $argv[1]; $script = $argv[2];
+$s = @stream_socket_client($a[0] === "/" ? "unix://$a" : "tcp://$a", $en, $es, 3);
+if (!$s) { echo "ERR:connect"; exit(1); }
+stream_set_timeout($s, 5);
+function rec($t, $c) { return chr(1).chr($t).pack("n", 1).pack("n", strlen($c))."\0\0".$c; }
+function len($n) { return $n < 128 ? chr($n) : pack("N", $n | 0x80000000); }
+$p = "";
+foreach (array("SCRIPT_FILENAME" => $script, "SCRIPT_NAME" => "/".basename($script),
+  "REQUEST_URI" => "/".basename($script), "DOCUMENT_ROOT" => dirname($script),
+  "REQUEST_METHOD" => "GET", "QUERY_STRING" => "", "SERVER_PROTOCOL" => "HTTP/1.1",
+  "GATEWAY_INTERFACE" => "CGI/1.1", "SERVER_SOFTWARE" => "php-fix") as $k => $v)
+  $p .= len(strlen($k)).len(strlen($v)).$k.$v;
+fwrite($s, rec(1, pack("nC", 1, 0)."\0\0\0\0\0").rec(4, $p).rec(4, "").rec(5, ""));
+$out = "";
+while (strlen($h = (string)stream_get_contents($s, 8)) === 8) {
+  $r = unpack("Cv/Ct/nid/nlen/Cpad", $h);
+  $c = $r["len"] ? (string)stream_get_contents($s, $r["len"]) : "";
+  if ($r["pad"]) stream_get_contents($s, $r["pad"]);
+  if ($r["t"] == 6) $out .= $c;
+  if ($r["t"] == 3) break;
+}
+echo preg_match("/PHPFIX:[^\r\n]*/", $out, $m) ? $m[0] : "ERR:no-answer";'
+
+# pool files (contain both listen= and pm=)
+find_pool_files() {
+  [ ${#existing_roots[@]} -gt 0 ] || return 0
+  find "${existing_roots[@]}" -xdev -type f -name '*.conf' -print0 2>/dev/null \
+    | xargs -0 -r grep -lE '^[[:space:]]*listen[[:space:]]*=' 2>/dev/null \
+    | xargs -d '\n' -r grep -lE '^[[:space:]]*pm[[:space:]]*=' 2>/dev/null | sort -u
+}
+
+# prints "<pool>|<address>|<PHP_VERSION>|<value>" or "<pool>|<address>|ERR|<reason>"
+fcgi_pools() {
+  [ "$(id -u)" -eq 0 ] || return 0
+  local cli dir pool addr out f
+  cli="$(find_php_bins | head -1)"; [ -n "$cli" ] || return 0
+  dir="/run/php-fix.$$"
+  mkdir -m 755 "$dir" 2>/dev/null || return 0
+  printf '%s' "$FCGI_CLIENT" > "$dir/client.php"
+  echo "<?php echo 'PHPFIX:'.PHP_VERSION.'|'.ini_get('${DIRECTIVE}');" > "$dir/check.php"
+  chmod 644 "$dir/check.php"
+  while read -r f; do
+    awk -F'=' '/^[[:space:]]*\[[^]]+\][[:space:]]*$/ { gsub(/[][[:space:]]/, ""); pool=$0 }
+               /^[[:space:]]*listen[[:space:]]*=/ && pool != "global" { v=$2; gsub(/^[[:space:]]+|[[:space:]]+$/, "", v); print pool "|" v }' "$f"
+  done < <(find_pool_files) | sort -u | while IFS='|' read -r pool addr; do
+    case "$addr" in
+      /*)          [ -S "$addr" ] || { echo "$pool|$addr|ERR|not running"; continue; } ;;
+      *[!0-9]*:*)  addr="$(echo "$addr" | sed -E 's/^(\*|0\.0\.0\.0|\[::\]):/127.0.0.1:/')" ;;
+      *[!0-9]*)    echo "$pool|$addr|ERR|unsupported listen address"; continue ;;
+      *)           addr="127.0.0.1:$addr" ;;
+    esac
+    out="$(timeout 10 "$cli" -n "$dir/client.php" "$addr" "$dir/check.php" 2>/dev/null)"
+    case "$out" in
+      PHPFIX:*) out="${out#PHPFIX:}"; echo "$pool|$addr|${out%%|*}|${out#*|}" ;;
+      *)        echo "$pool|$addr|ERR|no answer (stopped, chroot or open_basedir?)" ;;
+    esac
+  done
+  rm -rf "$dir"
+}
+
+# ---------------------------------------------------------------------------
+# --probe=URL: does multipart reach this PHP URL? (read-only, harmless requests)
+# ---------------------------------------------------------------------------
+if [ "$MODE" = probe ]; then
+  command -v curl >/dev/null 2>&1 || { err "curl is required for --probe"; exit 1; }
+  info "Probing $PROBE_URL with 5 harmless requests (no exploit payload). Only probe sites you are authorized to test."
+  pc() { curl -sk -o /dev/null -m 20 -w '%{http_code}' "$@" "$PROBE_URL" 2>/dev/null; }
+  c_get="$(pc)"; c_url="$(pc -d php_fix_probe=1)"
+  [ "$c_get" = 000 ] && [ "$c_url" = 000 ] && { err "No answer from $PROBE_URL"; exit 2; }
+  info "GET: $c_get | urlencoded POST: $c_url (baseline)"
+  BLOCKED=1
+  probe_one() {   # <label> <code>
+    case "$2" in
+      403|406|444|000|501)
+        if [ "$2" != "$c_url" ]; then ok "$1: $2, blocked before PHP"; return; fi ;;
+    esac
+    err "$1: $2, REACHES the application (same path as a normal request)"; BLOCKED=0
+  }
+  probe_one "multipart POST" "$(pc -F php_fix_probe=1)"
+  probe_one "multipart PUT" "$(pc -X PUT -F php_fix_probe=1)"
+  probe_one "mixed-case Content-Type" "$(pc -H 'Content-Type: MuLtIpArT/form-data; boundary=phpfix' \
+    --data-binary $'--phpfix\r\nContent-Disposition: form-data; name="php_fix_probe"\r\n\r\n1\r\n--phpfix--\r\n')"
+  info "A 403 can also come from the app or a security plugin; an edge block is not a patch."
+  [ "$BLOCKED" -eq 1 ] && exit 0
+  exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# --user-ini=DIR: shared hosting without root (PHP-FPM / CGI / LiteSpeed read .user.ini)
+# ---------------------------------------------------------------------------
+if [ "$MODE" = userini ]; then
+  if [ "$(id -u)" -eq 0 ]; then
+    err "Run --user-ini as the site's own user, not root (root writing into a user-owned directory is unsafe)."
+    err "As root, use the default mode instead: it locks every pool server-wide."
+    exit 1
+  fi
+  f="${USERINI_DIR%/}/.user.ini"
+  [ -L "$f" ] && { err "Refusing to write through symlink: $f"; exit 1; }
+  if [ -f "$f" ] && grep -Eiq "$ACTIVE_RE" "$f" && ! grep -Ei "$ACTIVE_RE" "$f" | grep -Eivq "$OFF_RE"; then
+    ok "Already Off: $f"
+  elif [ "$DRY_RUN" -eq 1 ]; then
+    info "[dry-run] Would set ${DIRECTIVE} = 0 in $f"
+  else
+    if [ -f "$f" ]; then cp -p "$f" "$f.bak-$TS" || { err "Backup failed: $f"; exit 1; }; fi
+    if [ -f "$f" ] && grep -Eiq "$ANY_RE" "$f"; then
+      sed -i -E "s/${ANY_RE}.*/${DIRECTIVE} = 0/I" "$f"
+    else
+      printf '\n; php-fix: php2shell (CVE-2026-109618 / CVE-2026-109619) mitigation\n%s = 0\n' "$DIRECTIVE" >> "$f"
+    fi
+    ok "Wrote ${DIRECTIVE} = 0 to $f$([ -f "$f.bak-$TS" ] && echo "  (backup: $f.bak-$TS)")"
+  fi
+  info "PHP picks it up within user_ini.cache_ttl (default 5 minutes). It applies to this directory and below."
+  info "Works with PHP-FPM, CGI/FastCGI and LiteSpeed. Apache mod_php ignores .user.ini: there, add"
+  info "  php_flag ${DIRECTIVE} off"
+  info "to .htaccess instead, and load the site right after (under PHP-FPM that line causes a 500 error)."
+  info "Verify: a temporary <?php var_export(ini_get('${DIRECTIVE}')); file must print '0' or ''. Delete it afterwards."
+  exit 0
+fi
+
+# ---------------------------------------------------------------------------
 # --check: read-only patch status report
 # ---------------------------------------------------------------------------
+# classify <PHP_VERSION> <effective value> [binary for backport lookup] -> sets STATUS, NOTE, MIT
+classify() {
+  local ver="$1" v="$2" b="${3:-}" n fixed="" p
+  n="$(branch_num "$ver")"
+  if [ -z "$n" ]; then STATUS=UNKNOWN; MIT=unknown; NOTE="could not read PHP version"; return; fi
+  if is_off "$v" && [ "$n" -ge 504 ]; then MIT=on; else MIT=off; fi
+  for p in $PATCHED_VERSIONS; do [ "$(branch_num "$p")" = "$n" ] && fixed="$p"; done
+  if [ "$n" -lt 504 ]; then STATUS=LEGACY; MIT=impossible; NOTE="EOL, no patch, and the mitigation cannot apply (< 5.4). Upgrade PHP."
+  elif [ -n "$fixed" ] && ver_ge "$ver" "$fixed"; then STATUS=PATCHED; NOTE=">= $fixed"
+  elif [ -n "$b" ] && backported "$b"; then STATUS=PATCHED; NOTE="distro backport (CVE in package changelog)"
+  elif [ "$n" -lt 802 ]; then STATUS=EOL; NOTE="EOL branch, no official patch expected. Upgrade PHP."
+  elif [ -n "$fixed" ]; then STATUS=UNPATCHED; NOTE="fixed in $fixed"
+  else STATUS=UNKNOWN; NOTE="fixed versions not known to this php-fix version"
+  fi
+}
+
+JSON_ROWS=()
+json_str() { local x; x="$(clean "$1")"; x="${x//\\/\\\\}"; printf '"%s"' "${x//\"/\\\"}"; }
+# report <kind> <target> <version> <status> <mitigation> <note>
+report() {
+  if [ "$JSON" -eq 1 ]; then
+    JSON_ROWS+=("{\"kind\":$(json_str "$1"),\"target\":$(json_str "$2"),\"php\":$(json_str "$3"),\"status\":$(json_str "$4"),\"mitigation\":$(json_str "$5"),\"note\":$(json_str "$6")}")
+    return
+  fi
+  local line="$2 ($1 $3): $4, mitigation $5. $6"
+  case "$4" in PATCHED) ok "$line" ;; UNKNOWN) info "$line" ;; *) err "$line" ;; esac
+}
+
 if [ "$MODE" = check ]; then
-  info "php-fix $VERSION patch status (read-only)"
-  [ -z "$PATCHED_VERSIONS" ] && info "Official fixed versions are not in this script yet; update php-fix after the advisory is out."
+  [ "$JSON" -eq 1 ] || info "php-fix $VERSION patch status (read-only)"
+  [ -z "$PATCHED_VERSIONS" ] && [ "$JSON" -eq 0 ] && info "Official fixed versions are not in this script yet; update php-fix after the advisory is out."
   UNPATCHED=0
   while IFS='|' read -r b sapi ver v; do
-    n="$(branch_num "$ver")"; [ -n "$n" ] || continue
-    if is_off "$v" && [ "$n" -ge 504 ]; then mit="mitigation on"; else mit="mitigation OFF"; fi
-    fixed=""
-    for p in $PATCHED_VERSIONS; do [ "$(branch_num "$p")" = "$n" ] && fixed="$p"; done
-    if [ "$n" -lt 504 ]; then
-      err "$b ($sapi $ver): EOL, NO PATCH and the mitigation cannot apply (< 5.4). Upgrade PHP."; UNPATCHED=1
-    elif [ -n "$fixed" ] && ver_ge "$ver" "$fixed"; then
-      ok "$b ($sapi $ver): PATCHED (>= $fixed)"
-    elif backported "$b"; then
-      ok "$b ($sapi $ver): PATCHED (distro backport, CVE in package changelog)"
-    elif [ "$n" -lt 802 ]; then
-      err "$b ($sapi $ver): EOL branch, no official patch expected; $mit. Upgrade PHP."; UNPATCHED=1
-    elif [ -n "$fixed" ]; then
-      err "$b ($sapi $ver): UNPATCHED (fixed in $fixed); $mit"; UNPATCHED=1
-    else
-      info "$b ($sapi $ver): fix status unknown; $mit"; UNPATCHED=1
-    fi
+    classify "$ver" "$v" "$b"
+    report "$sapi" "$b" "$ver" "$STATUS" "$MIT" "$NOTE"
+    [ "$STATUS" = PATCHED ] || UNPATCHED=1
   done < <(collect_bins)
+
+  # What each running FPM pool really sees (php.ini + pool overrides)
+  while IFS='|' read -r pool addr ver v; do
+    if [ "$ver" = ERR ]; then report fpm-pool "$pool @ $addr" "" UNKNOWN unknown "$v"; continue; fi
+    classify "$ver" "$v"
+    report fpm-pool "$pool @ $addr" "$ver" "$STATUS" "$MIT" "$NOTE"
+    [ "$STATUS" = PATCHED ] || UNPATCHED=1
+    [ "$MIT" = off ] && [ "$STATUS" != PATCHED ] && UNPATCHED=1
+  done < <(fcgi_pools)
+
+  # PHP inside running containers (read-only docker exec)
+  if command -v docker >/dev/null 2>&1; then
+    while read -r name; do
+      [ -n "$name" ] || continue
+      out="$(timeout 15 docker exec "$name" php -r "echo PHP_VERSION,'|',ini_get('${DIRECTIVE}');" 2>/dev/null)" || continue
+      classify "${out%%|*}" "${out#*|}"
+      report container "$name" "${out%%|*}" "$STATUS" "$MIT" "$NOTE Containers need a rebuilt image, not this script."
+      [ "$STATUS" = PATCHED ] || UNPATCHED=1
+    done < <(docker ps --format '{{.Names}}' 2>/dev/null)
+  fi
+
   # Held / version-locked packages silently skip the security update
   held=""
   command -v apt-mark >/dev/null 2>&1 && held="$(apt-mark showhold 2>/dev/null | grep -i php)"
   command -v dnf >/dev/null 2>&1 && held="$held $(dnf -q versionlock list 2>/dev/null | grep -i php)"
   command -v yum >/dev/null 2>&1 && ! command -v dnf >/dev/null 2>&1 && held="$held $(yum -q versionlock list 2>/dev/null | grep -i php)"
   held="$(echo $held)"
-  [ -n "$held" ] && { err "Held / version-locked PHP packages will NOT be updated: $held"; UNPATCHED=1; }
+  if [ -n "$held" ]; then
+    UNPATCHED=1
+    [ "$JSON" -eq 1 ] || err "Held / version-locked PHP packages will NOT be updated: $held"
+  fi
+
+  if [ "$JSON" -eq 1 ]; then
+    printf '{"tool":"php-fix","version":%s,"host":%s,"time":%s,"patched_versions":%s,"held_packages":%s,"exit":%s,"results":[' \
+      "$(json_str "$VERSION")" "$(json_str "$(hostname 2>/dev/null)")" "$(json_str "$(date -u +%Y-%m-%dT%H:%M:%SZ)")" \
+      "$(json_str "$PATCHED_VERSIONS")" "$(json_str "$held")" "$UNPATCHED"
+    (IFS=,; printf '%s' "${JSON_ROWS[*]+"${JSON_ROWS[*]}"}")
+    printf ']}\n'
+  fi
   exit "$UNPATCHED"
 fi
 
@@ -407,6 +599,14 @@ if [ "$MODE" = audit ]; then
     info "Top POST-to-.php clients in current access logs (last 200k lines per file, context only):"
     for l in "${LOGS[@]}"; do "${NICE[@]}" tail -n 200000 "$l" 2>/dev/null; done \
       | awk '$6 ~ /"POST/ && $7 ~ /\.php/ {print $1}' | tr -d '\000-\011\013-\037\177' | sort | uniq -c | sort -rn | head -10 | sed 's/^/     /'
+    # Only when Content-Type is logged (see --waf-print, "Logging")
+    MP="$(for l in "${LOGS[@]}"; do "${NICE[@]}" tail -n 200000 "$l" 2>/dev/null; done | grep -i 'ct="multipart' | tr -d '\000-\011\013-\037\177')"
+    if [ -n "$MP" ]; then
+      info "Top multipart senders (Content-Type is logged):"
+      printf '%s\n' "$MP" | awk '{print $1}' | sort | uniq -c | sort -rn | head -10 | sed 's/^/     /'
+      c5="$(printf '%s\n' "$MP" | awk '$9 ~ /^50[0-4]$/' | wc -l)"
+      [ "$c5" -gt 0 ] && flag "$c5 multipart request(s) answered with 500-504 (worker crashes under multipart = exploitation attempts?)"
+    fi
   fi
 
   # 8) PHP worker crashes: memory-corruption exploits usually crash workers while they are being tuned
@@ -678,7 +878,18 @@ info "Verification:"
 while IFS='|' read -r b sapi ver v; do
   check_result "$b" "$sapi" "$ver" "$v"
 done < <(collect_bins)
-[ -n "$(find_fpm_bins)" ] && info "FPM pool overrides are enforced via php_admin_flag (step 3); php-fpm -i shows php.ini values only."
+
+# What each running FPM pool really serves (php.ini + pool overrides), over FastCGI
+if [ "$DRY_RUN" -eq 1 ] || { [ "$NO_RESTART" -eq 1 ] && [ "$CHANGED" -gt 0 ]; }; then
+  [ -n "$(find_fpm_bins)" ] && info "Running FPM pools not queried (dry run / not reloaded yet). Check them later with --check."
+else
+  [ "$CHANGED" -gt 0 ] && sleep 2   # let the graceful reload finish
+  while IFS='|' read -r pool addr ver v; do
+    if [ "$ver" = ERR ]; then info "FPM pool $pool ($addr): not verified, $v"; continue; fi
+    if is_off "$v"; then ok "FPM pool $pool ($addr, PHP $ver): Off (live)"
+    else err "FPM pool $pool ($addr, PHP $ver): STILL ON (live, $v)"; FAILED=$((FAILED+1)); fi
+  done < <(fcgi_pools)
+fi
 
 echo
 echo "Changed: $CHANGED | Already Off: $SKIPPED | Errors: $FAILED"

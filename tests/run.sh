@@ -90,6 +90,7 @@ if [ "$MODPHP" = 1 ]; then
   echo "== --waf-print Apache rule, server-wide"
   W=/etc/apache2/conf-enabled/zz-php2shell-waf.conf
   bash $S --waf-print | sed -n '/^<Location "\/">/,/^<\/Location>/p' > "$W"
+  bash $S --waf-print | grep '^LogFormat .* php2shell$' >> "$W"
   grep -q 'Require all denied' "$W" && pass "extracted server-wide Apache rule" || fail "could not extract Apache rule"
   apache2ctl -t >/dev/null 2>&1 && pass "waf Apache snippet passes configtest" || fail "waf Apache snippet breaks config"
   mkdir -p /var/www/html/sub && cp /var/www/html/t.php /var/www/html/sub/
@@ -108,6 +109,8 @@ if [ "$MODPHP" = 1 ]; then
   }
   waf_checks http://localhost apache
   [ "$(code -F a=b localhost/sub/t.php)" = 403 ] && pass "apache: subfolder .htaccess cannot bypass" || fail "apache: subfolder .htaccess bypassed the rule"
+  out="$(bash $S --probe=http://localhost/t.php)"; rc=$?
+  [ "$rc" = 0 ] && echo "$out" | grep -q 'blocked before PHP' && pass "--probe reports the edge block (rc=0)" || fail "--probe on blocked server (rc=$rc)"
   a_stop
   # vhost with its own rewrite rules still inherits the block
   VH=/etc/apache2/sites-enabled/000-default.conf; cp "$VH" /root/vhost.orig
@@ -117,10 +120,14 @@ if [ "$MODPHP" = 1 ]; then
   a_stop
   cp /root/vhost.orig "$VH"
   rm -rf "$W" /var/www/html/sub
+  a_start
+  bash $S --probe=http://localhost/t.php >/dev/null; expect_rc 1 $? "--probe reports multipart reaching PHP without the rule"
+  a_stop
 
   echo "== nginx + FPM: .user.ini cannot re-enable on a locked pool; nginx WAF rule"
   echo 'session.upload_progress.enabled = On' > /var/www/html/.user.ini
   bash $S --waf-print | sed -n '/^map /,/^}/p' > /etc/nginx/conf.d/php2shell.conf
+  bash $S --waf-print | sed -n '/^log_format php2shell/,/;$/p' >> /etc/nginx/conf.d/php2shell.conf
   guard="$(bash $S --waf-print | grep -E '^#   (set|if) ' | sed 's/^#   //')"
   cat > /etc/nginx/sites-enabled/default <<NGX
 server {
@@ -136,6 +143,19 @@ NGX
   r="$(curl -s localhost:8080/t.php)"
   [ "$r" = "'0'" ] && pass ".user.ini cannot re-enable on locked pool (got $r)" || fail ".user.ini re-enabled it (got $r)"
   waf_checks http://localhost:8080 nginx
+
+  echo "== live FastCGI check of running pools"
+  out="$(bash $S --check 2>&1)"
+  echo "$out" | grep -q 'second @ .*(fpm-pool .*mitigation on' && pass "--check reads the live pool value over FastCGI" || { fail "--check live pool"; echo "$out" | grep -i pool; }
+  bash $S --no-restart | grep -q 'FPM pool second .*Off (live)' && pass "fix verification queries live pools" || fail "fix verification live pools"
+  # A pool that forces it On (added after the fix) must show up as mitigation off
+  POOL3="$(dirname "$POOL2")/third.conf"
+  printf '[third]\nuser = %s\ngroup = %s\nlisten = 127.0.0.1:9123\npm = ondemand\npm.max_children = 2\nphp_admin_value[session.upload_progress.enabled] = 1\n' "$WEBUSER" "$WEBUSER" > "$POOL3"
+  pkill -f php-fpm; sleep 1; "$FPMBIN" -D; sleep 1
+  bash $S --check 2>&1 | grep -q 'third @ 127.0.0.1:9123 (fpm-pool .*mitigation off' && pass "live check catches a pool forcing it On (TCP listener)" || fail "live check missed pool forcing On"
+  bash $S --check --json | php -r '$j = json_decode(stream_get_contents(STDIN), true); exit(is_array($j) && isset($j["results"][0]["status"]) ? 0 : 1);' \
+    && pass "--check --json is valid JSON" || fail "--check --json invalid"
+  rm -f "$POOL3"
   nginx -s stop; pkill -f php-fpm; sleep 1
   rm -f /var/www/html/.user.ini /etc/nginx/conf.d/php2shell.conf
 fi
@@ -162,6 +182,10 @@ echo "$out" | grep -q 'worker crash line(s) in /var/log/phptest-fpm.log' && pass
 echo "$out" | grep -q 'PHP file in a temp directory: /tmp/dropper.php' && pass "audit flags temp-dir PHP" || fail "audit missed temp-dir PHP"
 echo "$out" | grep -q 'Reverse-shell-like process' && pass "audit flags reverse-shell command line" || fail "audit missed reverse shell"
 kill "$RS" 2>/dev/null; pkill -f '203.0.113.7' 2>/dev/null; rm -f /var/log/phptest-fpm.log /tmp/dropper.php
+ALOG=/var/log/apache2/test-access.log; [ -d /var/log/apache2 ] || ALOG=/var/log/httpd/test_access_log
+echo '198.51.100.9 - - [21/Oct/2026:09:00:00 +0000] "POST /index.php HTTP/1.1" 502 0 "-" "x" ct="multipart/form-data; boundary=z"' > "$ALOG"
+bash $S --audit 2>&1 | grep -q 'multipart request(s) answered with 500-504' && pass "audit flags multipart 5xx from Content-Type logs" || fail "audit missed multipart 5xx"
+rm -f "$ALOG"
 
 echo "== --audit output cannot carry terminal escapes"
 evil="/var/www/html/$(printf 'x\033[2J\033[1A[OK] clean')"
@@ -192,6 +216,13 @@ grep -q 'php_admin_flag' "$POOL2" && fail "locked pool not restored" || pass "lo
 ls /etc/apache2/conf-available/zz-php2shell.conf /etc/apache2/conf-enabled/zz-php2shell.conf >/dev/null 2>&1 \
   && fail "mod_php conf still present" || pass "mod_php conf removed"
 [ "$MODPHP" = 1 ] && { apache2ctl -t >/dev/null 2>&1 && pass "apache config valid after revert" || fail "apache broken after revert"; }
+
+echo "== --user-ini (shared hosting, no root)"
+mkdir -p /srv/site && chown "$WEBUSER" /srv/site
+su -s /bin/bash "$WEBUSER" -c "bash $S --user-ini=/srv/site" >/dev/null; expect_rc 0 $? "--user-ini as site user"
+grep -q '^session.upload_progress.enabled = 0$' /srv/site/.user.ini && pass ".user.ini written" || fail ".user.ini not written"
+su -s /bin/bash "$WEBUSER" -c "bash $S --user-ini=/srv/site" | grep -q 'Already Off' && pass "--user-ini idempotent" || fail "--user-ini not idempotent"
+bash $S --user-ini=/srv/site >/dev/null 2>&1; expect_rc 1 $? "--user-ini refused as root"
 
 echo "== symlink planting refused"
 mkdir -p /srv/evil && chmod 777 /srv/evil && printf '[Session]\n' > /srv/evil/php.ini
