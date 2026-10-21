@@ -264,6 +264,13 @@ if command -v dpkg-deb >/dev/null; then
     && pass "cPanel: ea-php74 release 19 is PATCHED" || fail "cPanel backport not recognised"
   PHPFIX_CPANEL_FIXED="74:20" bash $S --check 2>&1 | grep -q "ea-php74/root/usr/bin/php (cli 7.4.33): UNPATCHED.*release 20 (EA4 25.91), installed 19: upgrade 'ea-php\*'" \
     && pass "cPanel: an older ea-php74 release is UNPATCHED" || fail "old cPanel release not reported"
+  dpkg -r ea-php74-php-cli >/dev/null 2>&1
+  # CloudLinux's own ea-php build (fixed at 7.4.33-18.*.cloudlinux.13) must not be judged by cPanel's numbers
+  sed -i 's/^Version: .*/Version: 7.4.33-18.el8.cloudlinux.13/' "$PK/DEBIAN/control"
+  dpkg-deb -b "$PK" /tmp/ea-php74.deb >/dev/null 2>&1 && dpkg -i /tmp/ea-php74.deb >/dev/null 2>&1
+  out="$(bash $S --check 2>&1 | grep 'ea-php74/root/usr/bin/php (cli 7.4.33)')"
+  [ -n "$out" ] && ! echo "$out" | grep -q 'cPanel EA4' \
+    && pass "CloudLinux ea-php build not judged by cPanel release numbers" || fail "CloudLinux ea-php judged by cPanel release numbers: $out"
   dpkg -r ea-php74-php-cli >/dev/null 2>&1; rm -rf "$PK" /tmp/ea-php74.deb; rmdir -p /opt/cpanel/ea-php74/root/usr/bin 2>/dev/null
 fi
 

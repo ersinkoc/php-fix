@@ -18,7 +18,7 @@
 
 set -u
 
-VERSION="1.10.0"
+VERSION="1.11.0"
 DIRECTIVE="session.upload_progress.enabled"
 TS="$(date +%Y%m%d-%H%M%S)"
 MODE=fix
@@ -41,7 +41,8 @@ UBUNTU_FIXED="${PHPFIX_UBUNTU_FIXED:-trusty:5.5:5.5.9+dfsg-1ubuntu4.29+esm18 xen
   bionic:7.2:7.2.24-0ubuntu0.18.04.17+esm14 focal:7.4:7.4.3-4ubuntu2.29+esm5 jammy:8.1:8.1.2-1ubuntu2.28
   noble:8.3:8.3.6-0ubuntu0.24.04.13 resolute:8.5:8.5.4-0ubuntu1.5 stonking:8.5:8.5.9-0ubuntu2.1}"
 UBUNTU_USN="USN-8948-1 / USN-8948-2"
-# cPanel EA4 25.91 backports the fix into ea-php74 / 80 / 81 at the same version: branch:first fixed release
+# cPanel EA4 25.91 backports the fix into ea-php74 / 80 / 81 at the same version: branch:first fixed release.
+# CloudLinux ships its own ea-php builds (release *.cloudlinux.N, numbered differently): those go by changelog.
 CPANEL_FIXED="${PHPFIX_CPANEL_FIXED:-74:19 80:12 81:5}"
 
 usage() {
@@ -389,6 +390,7 @@ cpanel_build() {
   elif command -v dpkg >/dev/null 2>&1 && pkg="$(dpkg -S "$b" 2>/dev/null | head -1 | cut -d: -f1)" && [ -n "$pkg" ]; then
     rel="$(dpkg-query -W -f='${Version}' "$pkg" 2>/dev/null)"; rel="${rel##*-}"
   fi
+  case "$rel" in *cloudlinux*) return 0 ;; esac
   rel="$(echo "$rel" | grep -oE '^[0-9]+')"
   [ -n "$rel" ] || return 0
   for e in $CPANEL_FIXED; do
@@ -580,6 +582,8 @@ update_hints() {
                   *)   info "  cPanel EA4 PHP: ${pm:-dnf} upgrade 'ea-php*'   (or WHM > EasyApache 4; /scripts/upcp)" ;; esac
     info "    EA4 25.91 (21 Oct): ea-php82-85 -> 8.2.35 / 8.3.36 / 8.4.27 / 8.5.12; ea-php74 / 80 / 81 backported"
     info "    at the same version (7.4.33-19, 8.0.30-12, 8.1.34-5). Then restart: /scripts/restartsrv_apache_php_fpm"
+    info "    On CloudLinux, ea-php comes from CloudLinux (release *.cloudlinux.N, ea-php52-85 fixed since 21 Oct 20:55 UTC)."
+    info "    Verify: rpm -q --changelog ea-php74-php-cli | grep -E 'CVE-2026-(109618|109619)'"
   fi
   if [ -d /usr/local/directadmin ]; then
     info "  DirectAdmin CustomBuild compiles PHP itself (distro patches do not apply):"
