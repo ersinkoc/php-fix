@@ -15,7 +15,7 @@
 
 set -u
 
-VERSION="1.2.2"
+VERSION="1.3.0"
 DIRECTIVE="session.upload_progress.enabled"
 TS="$(date +%Y%m%d-%H%M%S)"
 MODE=fix
@@ -94,48 +94,80 @@ if [ "$MODE" = waf ]; then
   cat <<'EOF'
 # php2shell: WAF / proxy rules for the multipart path.
 # NOTHING has been changed. Review, adapt the upload allowlist to your apps, test on staging.
-# Allowlist entries are EXACT script paths (anchored with ^...$). Never use prefixes like
-# ^/upload: they also match /upload-anything.php. Every allowlisted path stays exposed.
+#
+# - Match ANY method: PHP 8.4's request_parse_body() parses multipart on PUT/PATCH too.
+# - Match "multipart" anywhere in Content-Type, case-insensitive (no ^ anchor, no exact type).
+# - Allowlist entries are EXACT script paths (^...$). Never prefixes like ^/upload: they also
+#   match /upload-anything.php. Every allowlisted path stays exposed.
+# - Blocking multipart breaks file uploads, FormData/AJAX forms, Contact Form 7, Livewire...
+#   outside the allowlist. A WAF only protects traffic that goes through it: lock the origin
+#   down to the proxy/CDN IP ranges, or direct-to-IP requests skip it.
+# - Do NOT block on the PHPSESSID cookie: it breaks sessions and doesn't stop the parser.
 
 ############ ModSecurity (v2 / v3) — narrow, safe for almost every site ############
 # Blocks requests carrying the upload-progress field (session.upload_progress.name,
 # default PHP_SESSION_UPLOAD_PROGRESS). Adjust if you changed that ini setting.
+# ModSecurity's multipart parser is not PHP's: treat this as a filter, not a guarantee.
 SecRule ARGS_NAMES "@streq PHP_SESSION_UPLOAD_PROGRESS" \
   "id:1026109,phase:2,deny,status:403,log,msg:'php2shell upload_progress probe'"
 
 ############ ModSecurity — broad: multipart only on allowlisted paths ############
-SecRule REQUEST_HEADERS:Content-Type "@rx (?i)^multipart/form-data" \
+SecRule REQUEST_HEADERS:Content-Type "@rx (?i)multipart" \
   "id:1026110,phase:1,deny,status:403,log,msg:'php2shell multipart outside allowlist',chain"
   SecRule REQUEST_FILENAME "!@rx ^/(wp-admin/async-upload\.php|wp-admin/media-new\.php)$" ""
 
 ############ nginx — multipart only on allowlisted paths ############
 # http {} context:
-map "$request_method:$http_content_type" $php2shell_mp {
+map $http_content_type $php2shell_mp {
     default 0;
-    "~*^POST:multipart/form-data" 1;
+    "~*multipart" 1;
 }
 map $uri $php2shell_upload_ok {
     default 0;
     ~^/(wp-admin/async-upload\.php|wp-admin/media-new\.php)$ 1;
 }
-# inside every `location ~ \.php$ { ... }`:
+# inside EVERY server {} block that can reach PHP (server level, not only in location ~ \.php$):
 #   set $php2shell "$php2shell_mp$php2shell_upload_ok";
 #   if ($php2shell = "10") { return 403; }
 
-############ Apache 2.4 (no ModSecurity) — multipart only on allowlisted paths ############
-# Put inside EACH <VirtualHost> (needs mod_rewrite). Rewrite rules in the main server config
-# are NOT inherited by vhosts unless the vhost has `RewriteOptions Inherit`.
-<IfModule mod_rewrite.c>
-    RewriteEngine On
-    RewriteCond %{REQUEST_METHOD} =POST
-    RewriteCond %{HTTP:Content-Type} ^multipart/form-data [NC]
-    RewriteCond %{REQUEST_URI} !^/(wp-admin/async-upload\.php|wp-admin/media-new\.php)$ [NC]
-    RewriteRule ^ - [F]
-</IfModule>
+############ Apache 2.4 — multipart only on allowlisted paths (server-wide, all vhosts) ############
+# Save as /etc/apache2/conf-enabled/zz-php2shell-waf.conf (Debian/Ubuntu),
+# /etc/httpd/conf.d/zz-php2shell-waf.conf (RHEL) or /etc/apache2/conf.d/zz-php2shell-waf.conf
+# (cPanel), then `apachectl -t && apachectl graceful`. No mod_rewrite needed.
+# The <If> sits inside <Location "/">, which Apache merges AFTER .htaccess files: a
+# `Require all granted` or `RewriteEngine On` in any .htaccess cannot undo it.
+# (A bare top-level <If> CAN be overridden by .htaccess. Keep the <Location> wrapper.)
+<Location "/">
+    <If "req('Content-Type') =~ /multipart/i && %{REQUEST_URI} !~ m#^/(wp-admin/async-upload\.php|wp-admin/media-new\.php)$#">
+        Require all denied
+    </If>
+</Location>
+
+############ Apache / LiteSpeed .htaccess (shared hosting, no server config access) ############
+# Top of the site's .htaccess, above the CMS block. Caveat: a subfolder .htaccess with its own
+# "RewriteEngine On" is NOT covered by this; the server-wide <Location> version above is.
+RewriteEngine On
+RewriteCond %{HTTP:Content-Type} multipart [NC]
+RewriteCond %{REQUEST_URI} !^/(wp-admin/async-upload\.php|wp-admin/media-new\.php)$ [NC]
+RewriteRule ^ - [F]
+
+############ Caddy / FrankenPHP ############
+# Inside the site block, in the same route/handle that runs php_fastcgi / php_server:
+@php2shell {
+    header_regexp Content-Type (?i)multipart
+    not path /wp-admin/async-upload.php /wp-admin/media-new.php
+}
+respond @php2shell 403
+
+############ HAProxy (frontend, above other http-request rules; not with TLS passthrough) ############
+acl php2shell_mp req.hdr(content-type) -m sub -i multipart
+acl php2shell_ok path /wp-admin/async-upload.php /wp-admin/media-new.php
+http-request deny if php2shell_mp !php2shell_ok
 
 ############ Cloudflare (WAF custom rule expression, action: Block) ############
-# (http.request.method eq "POST" and any(http.request.headers["content-type"][*] contains "multipart/form-data")
+# (any(lower(http.request.headers["content-type"][*])[*] contains "multipart")
 #  and not http.request.uri.path in {"/wp-admin/async-upload.php" "/wp-admin/media-new.php"})
+# IP Access "Allow" rules skip custom rules. Restrict the origin to Cloudflare IP ranges.
 EOF
   exit 0
 fi
@@ -287,6 +319,13 @@ if [ "$MODE" = check ]; then
       info "$b ($sapi $ver): fix status unknown; $mit"; UNPATCHED=1
     fi
   done < <(collect_bins)
+  # Held / version-locked packages silently skip the security update
+  held=""
+  command -v apt-mark >/dev/null 2>&1 && held="$(apt-mark showhold 2>/dev/null | grep -i php)"
+  command -v dnf >/dev/null 2>&1 && held="$held $(dnf -q versionlock list 2>/dev/null | grep -i php)"
+  command -v yum >/dev/null 2>&1 && ! command -v dnf >/dev/null 2>&1 && held="$held $(yum -q versionlock list 2>/dev/null | grep -i php)"
+  held="$(echo $held)"
+  [ -n "$held" ] && { err "Held / version-locked PHP packages will NOT be updated: $held"; UNPATCHED=1; }
   exit "$UNPATCHED"
 fi
 
@@ -299,6 +338,8 @@ if [ "$MODE" = audit ]; then
   MIN=$((AUDIT_HOURS*60)); FINDINGS=0
   flag() { err "$*"; FINDINGS=$((FINDINGS+1)); }
   info "php-fix $VERSION audit, last ${AUDIT_HOURS}h (read-only, heuristic: findings need human review)"
+  command -v ps >/dev/null 2>&1 || err "ps not found (install procps): process checks are SKIPPED"
+  command -v ss >/dev/null 2>&1 || info "ss not found (install iproute2): network check skipped"
 
   WEBROOTS=()
   for r in /var/www /srv/www /srv/http /home /www/wwwroot /usr/share/nginx/html /usr/local/lsws/Example/html; do
@@ -368,7 +409,47 @@ if [ "$MODE" = audit ]; then
       | awk '$6 ~ /"POST/ && $7 ~ /\.php/ {print $1}' | tr -d '\000-\011\013-\037\177' | sort | uniq -c | sort -rn | head -10 | sed 's/^/     /'
   fi
 
-  # 8) PHP containers: this script does not reach inside them
+  # 8) PHP worker crashes: memory-corruption exploits usually crash workers while they are being tuned
+  CRASH_RE='exited on signal (6|7|11)|SIGSEGV|SIGBUS|Segmentation fault|exit signal Aborted'
+  for l in /var/log/php*-fpm.log /var/log/php-fpm/*log /opt/cpanel/ea-php*/root/usr/var/log/php-fpm.log \
+           /opt/remi/php*/root/var/log/php-fpm/*log /opt/plesk/php/*/var/log/php-fpm.log \
+           /www/server/php/*/var/log/php-fpm.log /var/log/apache2/error*.log /var/log/httpd/error_log \
+           /usr/local/apache/logs/error_log /usr/local/lsws/logs/error.log; do
+    [ -f "$l" ] || continue
+    c="$("${NICE[@]}" tail -n 200000 "$l" 2>/dev/null | grep -Eic "$CRASH_RE")"
+    [ "$c" -gt 0 ] && flag "$c PHP/web worker crash line(s) in $l (check timestamps; repeated crashes = exploitation attempts?)"
+  done
+  if command -v journalctl >/dev/null 2>&1; then
+    kc="$(journalctl -k --since "${AUDIT_HOURS} hours ago" --no-pager 2>/dev/null | grep -Ec 'segfault at .*(php|lsphp|httpd|apache2)')"
+  else
+    kc="$(dmesg 2>/dev/null | grep -Ec 'segfault at .*(php|lsphp|httpd|apache2)')"
+  fi
+  [ "${kc:-0}" -gt 0 ] && flag "$kc kernel segfault record(s) for PHP / web server processes"
+
+  # 9) PHP dropped into temp directories (write-execute-delete droppers)
+  while read -r f; do [ -n "$f" ] && flag "PHP file in a temp directory: $f"; done < <(find /tmp /var/tmp /dev/shm -maxdepth 3 -type f \
+    \( -name '*.php' -o -name '*.phtml' -o -name '*.phar' \) -mmin "-$MIN" 2>/dev/null | head -20)
+
+  # 10) Reverse-shell patterns in any running command line
+  while read -r pid user args; do
+    flag "Reverse-shell-like process $pid ($user): ${args:0:150}"
+  done < <(ps -eo pid=,user=,args= 2>/dev/null | grep -E '/dev/(tcp|udp)/|mkfifo .*(nc|sh)|\bnc(at)? .*-[ec] |(ba)?sh -i|socat .*exec|fsockopen|pty\.spawn' \
+             | grep -v -e 'grep -E')
+
+  # 11) Shells / interpreters running as a web user and detached from their parent (double-forked)
+  while read -r pid user comm; do
+    flag "Detached $comm running as $user (pid $pid): $(ps -o args= -p "$pid" 2>/dev/null | cut -c1-150)"
+  done < <(ps -eo pid=,ppid=,user=,comm= 2>/dev/null | awk '
+    $2 == 1 && $3 ~ /^(www-data|apache|nginx|nobody|http|httpd|wwwrun|lsadm)$/ &&
+    $4 ~ /^(sh|bash|dash|zsh|ksh|nc|ncat|netcat|socat|python[0-9.]*|perl|ruby|php)$/ { print $1, $3, $4 }')
+
+  # 12) Network connections owned by shells / interpreters
+  if command -v ss >/dev/null 2>&1; then
+    while read -r line; do [ -n "$line" ] && flag "Shell/interpreter with a network connection: ${line:0:200}"; done < <(ss -tnpH state established 2>/dev/null \
+      | grep -E 'users:\(\("(sh|bash|dash|nc|ncat|netcat|socat|perl|python[0-9.]*|ruby)"')
+  fi
+
+  # 13) PHP containers: this script does not reach inside them
   if command -v docker >/dev/null 2>&1; then
     while read -r line; do [ -n "$line" ] && err "PHP container not covered (patch / rebuild its image): $line"; done \
       < <(docker ps --format '{{.Names}} ({{.Image}})' 2>/dev/null | grep -i php)
@@ -486,6 +567,41 @@ if [ ${#existing_roots[@]} -gt 0 ]; then
       && { ok "Fixed FPM pool: $f  (backup: $f.bak-$TS)"; CHANGED=$((CHANGED+1)); } \
       || { err "Could not fix FPM pool: $f"; FAILED=$((FAILED+1)); }
   done
+
+  # 3b) Pools with no setting at all: add php_admin_flag, otherwise a .user.ini (or a pool
+  #     php_value added later) can turn it back on over php.ini. Guarded by `php-fpm -t`.
+  mapfile -t BARE_POOLS < <(find "${existing_roots[@]}" -xdev -type f -name '*.conf' -print0 2>/dev/null \
+    | xargs -0 -r grep -lE '^[[:space:]]*listen[[:space:]]*=' 2>/dev/null \
+    | xargs -d '\n' -r grep -lE '^[[:space:]]*pm[[:space:]]*=' 2>/dev/null \
+    | xargs -d '\n' -r grep -lE '^[[:space:]]*\[[^]]+\][[:space:]]*$' 2>/dev/null \
+    | xargs -d '\n' -r grep -LE "^[[:space:]]*${POOL_RE}" 2>/dev/null | sort -u)
+  if [ ${#BARE_POOLS[@]} -gt 0 ]; then
+    FPM_OK_BEFORE=()
+    while read -r b; do [ -n "$b" ] && "$b" -t >/dev/null 2>&1 && FPM_OK_BEFORE+=("$b"); done < <(find_fpm_bins)
+    HARDENED=()
+    for f in "${BARE_POOLS[@]}"; do
+      if [ "$DRY_RUN" -eq 1 ]; then info "[dry-run] Would add php_admin_flag to FPM pool(s) in: $f"; continue; fi
+      tmp="$(mktemp)"
+      # after every [pool] header except [global]
+      awk -v line="php_admin_flag[${DIRECTIVE}] = off" \
+        '{ print } /^[[:space:]]*\[[^]]+\][[:space:]]*$/ && !/^[[:space:]]*\[global\]/ { print line }' "$f" > "$tmp"
+      grep -qF "php_admin_flag[${DIRECTIVE}]" "$tmp" || { rm -f "$tmp"; continue; }   # only [global] here
+      backup "$f" || { err "Backup failed: $f"; FAILED=$((FAILED+1)); rm -f "$tmp"; continue; }
+      cat "$tmp" > "$f" && HARDENED+=("$f") \
+        && ok "Locked FPM pool(s) with php_admin_flag: $f  (backup: $f.bak-$TS)" \
+        || { err "Could not lock FPM pool: $f"; FAILED=$((FAILED+1)); }
+      rm -f "$tmp"
+    done
+    for b in ${FPM_OK_BEFORE[@]+"${FPM_OK_BEFORE[@]}"}; do
+      [ ${#HARDENED[@]} -gt 0 ] || break
+      if ! "$b" -t >/dev/null 2>&1; then
+        err "$b -t fails after locking pools: restoring them, FPM config left as it was"
+        for f in "${HARDENED[@]}"; do cp -p "$f.bak-$TS" "$f"; done
+        FAILED=$((FAILED+1)); HARDENED=(); break
+      fi
+    done
+    CHANGED=$((CHANGED+${#HARDENED[@]}))
+  fi
 fi
 
 # 4) mod_php: global php_admin_flag so .htaccess cannot turn it back on

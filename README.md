@@ -22,7 +22,7 @@ curl -fsSL https://raw.githubusercontent.com/ersinkoc/php-fix/main/install.sh | 
 Piping `main` into `sudo bash` means trusting whatever is on `main` at that moment. For production, use a release instead. Every release is built by GitHub Actions and ships with a `SHA256SUMS` file and a signed [build provenance attestation](https://docs.github.com/actions/security-for-github-actions/using-artifact-attestations):
 
 ```bash
-V=v1.2.2
+V=v1.3.0
 curl -fsSLO https://github.com/ersinkoc/php-fix/releases/download/$V/install.sh
 curl -fsSLO https://github.com/ersinkoc/php-fix/releases/download/$V/SHA256SUMS
 sha256sum -c SHA256SUMS                                      # integrity
@@ -37,9 +37,9 @@ sudo bash install.sh
 | `sudo bash install.sh` | **Yes** (with backups) | Applies the mitigation, reloads services gracefully, verifies |
 | `... --dry-run` | No | Shows what the default mode would change |
 | `... --no-restart` | Yes, without reloads | Applies the changes but doesn't reload services; reload them yourself later |
-| `... --check` | No | Per binary: **PATCHED** / **UNPATCHED** / **EOL, no patch** / unknown. Also detects distro backports via the package changelog |
+| `... --check` | No | Per binary: **PATCHED** / **UNPATCHED** / **EOL, no patch** / unknown. Also detects distro backports via the package changelog, and warns about held / version-locked PHP packages (`apt-mark hold`, `dnf versionlock`) that would silently skip the update |
 | `... --audit[=HOURS]` | No | Heuristic indicator-of-compromise sweep (default: last 48 h). Runs at lowest CPU/IO priority |
-| `... --waf-print` | No | Prints ModSecurity / nginx / Apache / Cloudflare rules for the multipart path |
+| `... --waf-print` | No | Prints rules for the multipart path: ModSecurity, nginx, Apache, LiteSpeed/.htaccess, Caddy/FrankenPHP, HAProxy, Cloudflare |
 | `... --revert[=STAMP]` | **Yes** | Restores the backups of the last run (or of the run `STAMP`, e.g. `20261021-120000`) and removes the mod_php drop-in |
 
 With curl, pass options like this: `curl -fsSL .../install.sh | sudo bash -s -- --check`
@@ -70,7 +70,12 @@ With curl, pass options like this: `curl -fsSL .../install.sh | sudo bash -s -- 
 1. **Finds every `php.ini`** under the usual locations (`/etc`, `/usr/local/etc`, `/usr/local/lib`, `/usr/local/php*`, `/opt/cpanel`, `/opt/alt`, `/opt/plesk/php`, `/opt/remi`, `/etc/opt/remi`, `/www/server/php`, `/usr/local/lsws`), plus the one `php --ini` reports.
 2. **Sets `session.upload_progress.enabled = Off`** in each one. It replaces an existing (commented or active) line, adds the setting under `[Session]`, or appends a `[Session]` block.
 3. **Fixes overrides** in additional `.ini` files (`conf.d/*.ini`) that turn the setting back on.
-4. **Hardens PHP-FPM pools.** Any `php_value` / `php_flag` for this directive becomes `php_admin_flag[session.upload_progress.enabled] = off`, so neither the app nor a `.user.ini` can re-enable it.
+4. **Locks every PHP-FPM pool.** Without this, a `.user.ini` with `On` overrides the php.ini `Off`.
+   - Any existing `php_value` / `php_flag` for this directive becomes `php_admin_flag[session.upload_progress.enabled] = off`.
+   - Pools with no setting at all get that line added.
+   - Each FPM binary runs `php-fpm -t` before and after the change. If a config that passed before fails afterwards, the pool files are restored on the spot.
+
+   Control panels (cPanel, Plesk) may regenerate pool files later. Re-run the script after panel PHP changes. The php.ini setting stays in place either way.
 5. **Hardens Apache mod_php.** If mod_php is loaded, it drops in `zz-php2shell.conf` with `php_admin_flag session.upload_progress.enabled off`, which `.htaccess` cannot override.
    - Debian / Ubuntu: `/etc/apache2/conf-available/` + `a2enconf`
    - RHEL family: `/etc/httpd/conf.d/`
@@ -92,7 +97,14 @@ This is a heuristic sweep, not proof either way. Every finding needs a human to 
 - Session files containing `upload_progress_` data, meaning the vulnerable code path was exercised
 - Recently changed cron jobs
 - Busiest POST-to-`.php` clients in the current access logs (context only)
+- **PHP / web worker crashes** (`SIGSEGV`, `exited on signal 11`, kernel `segfault at … php-fpm`) in FPM and Apache logs and the kernel log. Memory-corruption exploits usually crash workers while they are being tuned.
+- PHP files dropped in `/tmp`, `/var/tmp` or `/dev/shm`
+- Reverse-shell command lines on any process (`/dev/tcp/`, `mkfifo … nc`, `nc -e`, `bash -i`, `socat … exec`, `fsockopen`, `pty.spawn`)
+- Shells or interpreters running as a web user (`www-data`, `apache`, `nginx`, `nobody`, …) and detached from their parent (double-forked)
+- Shells or interpreters holding network connections (`ss`)
 - Running PHP Docker containers, which this script cannot reach
+
+If `ps` or `ss` is missing (e.g. minimal container images), the audit says which checks it skipped.
 
 ## Tested
 
@@ -106,17 +118,23 @@ CI runs [`tests/run.sh`](tests/run.sh) on every push. It installs real PHP from 
 | AlmaLinux 9 | 8.0 (EOL) | php-fpm + httpd |
 
 The tests cover:
-- dry-run changes nothing; php.ini, `conf.d` and FPM pool overrides are fixed; a second run is idempotent
-- **`.htaccess` with `php_flag … on` cannot re-enable the setting under mod_php** (a real HTTP request returns `'0'`)
-- `--check`, and `--audit` catching a planted webshell
-- `--audit` output stays clean when a malicious file name carries terminal escape sequences
-- the `--waf-print` Apache rule, pasted into a vhost, passes `apachectl -t` and behaves as intended:
-  - a multipart POST to `/t.php` gets `403`
-  - the prefix trick `/wp-admin/async-upload.php-evil.php` is blocked
-  - the allowlisted path and normal POSTs pass
-- the EOL warning and the `< 5.4` exit `2` path
-- `--revert` restores php.ini byte-for-byte and leaves Apache valid
-- world-writable directories are refused
+- **Fix and revert:**
+  - dry-run changes nothing; php.ini, `conf.d` and FPM pool overrides are fixed; a second run is idempotent
+  - a pool with no setting gets `php_admin_flag` and `php-fpm -t` still passes
+  - a non-FPM config containing `listen =` is left alone
+  - `--revert` restores php.ini and the pool files byte-for-byte and leaves Apache valid
+  - world-writable directories are refused
+- **Can it be re-enabled?** Each test is a real HTTP request that returns `'0'`:
+  - **mod_php:** a `.htaccess` with `php_flag … on` cannot turn it back on
+  - **nginx + PHP-FPM:** a `.user.ini` with `On` cannot turn it back on
+- **`--waf-print` rules, run in real Apache and nginx** (configtest passes in both):
+  - multipart POST, multipart **PUT** and a mixed-case `Content-Type` get `403`, as does the prefix trick `/wp-admin/async-upload.php-evil.php`
+  - the allowlisted path, urlencoded POSTs and JSON POSTs pass
+  - on Apache: a subfolder `.htaccess` with `RewriteEngine On` + `Require all granted` cannot bypass the rule, and neither can a vhost with its own rewrite rules
+- **`--audit` and `--check`:**
+  - `--audit` flags a planted webshell, a worker `SIGSEGV` log line, a PHP file in `/tmp` and a reverse-shell command line
+  - `--audit` output stays clean when file names carry terminal escapes (ESC, 8-bit and UTF-8 C1)
+  - `--check` runs; the EOL warning and the `< 5.4` exit `2` path are tested with stub binaries
 
 Run the tests locally with: `docker run --rm -v "$PWD:/src:ro" debian:trixie bash /src/tests/run.sh`
 
@@ -148,12 +166,45 @@ php-fpm8.3 -i | grep session.upload_progress.enabled   # FPM's php.ini (adjust b
 
 For the real web SAPI, including FPM pool settings, put `<?php var_export(ini_get('session.upload_progress.enabled'));` in a temporary file and open it in a browser. `''` or `'0'` means Off. **Delete the file afterwards.**
 
+## The second path: blocking multipart before PHP
+
+Disabling upload progress doesn't stop the multipart parser itself. For defense in depth until you patch, put a multipart filter in front of PHP. Run `--waf-print` for ready-made rules.
+
+- **Match every method, not just POST.** PHP 8.4's `request_parse_body()` parses multipart on PUT and PATCH too.
+- **Match `multipart` anywhere in `Content-Type`, case-insensitively.** Don't anchor it to `^multipart/form-data`.
+- **Allowlist exact script paths only** (`^/wp-admin/async-upload\.php$`), never prefixes like `^/upload`.
+- **Apache:** use the server-wide `<Location "/"> <If …> Require all denied` version. A bare top-level `<If>` or a `.htaccess` rewrite can be overridden by a subfolder `.htaccess`. We tested both bypasses.
+- **nginx:** put the guard at `server {}` level, so every route that ends up in PHP is covered.
+- **CDN / WAF:** it only protects traffic that goes through it. Restrict the origin to the CDN's IP ranges, or direct-to-IP requests skip it.
+- **Know what you'll break:** file uploads, `FormData`/AJAX forms, Contact Form 7 (multipart even without files) and Livewire/Filament uploads stop working outside the allowlist.
+- The narrow ModSecurity rule, which blocks only the `PHP_SESSION_UPLOAD_PROGRESS` field, is safe for almost every site. ModSecurity's multipart parser isn't PHP's, though, so treat it as a filter, not a guarantee.
+
+To check from outside that your edge really rejects multipart, test against a PHP file, not `/`:
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' -X PUT -F test=1 https://example.com/index.php   # want 403
+```
+
+## What does NOT help
+
+These come up a lot, but they don't stop php2shell:
+
+| Setting / measure | Why it doesn't help |
+|---|---|
+| `file_uploads = Off` | PHP still parses the multipart body and only skips the file parts |
+| `enable_post_data_reading = Off` | Breaks every normal form, and doesn't cover the explicit `request_parse_body()` parsing in PHP 8.4 |
+| `ini_set('session.upload_progress.enabled', 0)` | The setting is `PHP_INI_PERDIR`, and the body is parsed before your code runs |
+| `post_max_size`, `disable_functions`, maintenance mode | The parsing happens before any of these apply |
+| Security plugins, framework middleware, CSRF checks | They run after PHP has already parsed the body |
+| Blocking the `PHPSESSID` cookie | Breaks sessions, misses custom session names, and doesn't stop the parser |
+| A firewall, HTTPS or new passwords | None of them tell you whether the interpreter is patched |
+
 ## Not covered (check these yourself)
 
-- **The second bug path (multipart parser).** For defense in depth until you patch, run `--waf-print` and apply the rules that fit your setup. The narrow ModSecurity rule (blocks only the upload-progress field) is safe for almost every site. The broad "multipart only on allowlisted paths" rules need your real upload URLs first. List **exact script paths** anchored with `^…$`, never prefixes like `^/upload` (that also matches `/upload-anything.php`). The Apache rule goes inside each `<VirtualHost>`. Also see [syhunt/php2shell-protection](https://github.com/syhunt/php2shell-protection).
 - **`.user.ini` with PHP-CGI / LiteSpeed (non-FPM).** The setting is `PHP_INI_PERDIR`, so a site can turn it back on. `--audit` reports these files.
-- **Docker images.** Configure them in the image instead, e.g. add `RUN echo 'session.upload_progress.enabled=Off' > /usr/local/etc/php/conf.d/zz-php2shell.ini` and rebuild. `--audit` lists running PHP containers.
-- **Windows / IIS.** Not supported.
+- **Docker images.** Configure them in the image instead, e.g. add `RUN echo 'session.upload_progress.enabled=Off' > /usr/local/etc/php/conf.d/zz-php2shell.ini` and rebuild. Restarting the same container doesn't pick up a new image. `--audit` lists running PHP containers.
+- **Windows / IIS**, and software that bundles its own `php.exe` / `php-cgi.exe`. Not supported.
+- **Old distros.** Ubuntu 20.04 has no PPA PHP builds, and no fix has been confirmed for it. Distro backports keep the upstream version number, so compare the package revision against your distro's security advisory (`--check` looks for the CVE ids in the package changelog).
 
 ## Rollback
 
@@ -166,6 +217,19 @@ This restores every file from the most recent run's backups, removes the mod_php
 ## After patching
 
 Run `--check` to confirm every PHP binary is on a fixed build. Once you're on the fixed PHP release, you can turn upload progress back on if your applications need it. If they don't, leaving it off reduces attack surface.
+
+## Other tools and write-ups
+
+| Resource | What it's for |
+|---|---|
+| [syhunt/php2shell-protection](https://github.com/syhunt/php2shell-protection) | Apache `.htaccess` multipart block with a test page that checks whether multipart still reaches PHP |
+| [0xrsydn/php2shell-scan](https://github.com/0xrsydn/php2shell-scan) | Read-only **external** reachability check: does PHP still parse attacker multipart pre-auth? Supports before/after-patch baselines. Use it to verify your edge rules from outside |
+| [mikensec/php2shell-lab](https://github.com/mikensec/php2shell-lab) | Offline lab for analysing a PoC sample and building detection rules (no exploit included) |
+| [Florian Roth's process-watcher](https://github.com/Neo23x0/process-watcher) | Recommended by Huntress for watching PHP workers spawning shells when you have no EDR |
+| [Censys query gist](https://gist.github.com/silascutler/c7f04537a79ace89569f979d964af0f9) | Finding exposed PHP hosts |
+| [Vincent Schmalbach's write-up](https://www.vincentschmalbach.com/cve-2026-109618-and-cve-2026-109619-what-you-should-do-now/) | Container-tested rules for nginx, Apache, LiteSpeed, Caddy, FrankenPHP, HAProxy and Cloudflare, plus a list of what doesn't help |
+
+Timeline note: Sansec expects mass exploitation within minutes of the 14:00 UTC release, because the patch diff reveals the bug. Patch first, then run `--audit`.
 
 ## Roadmap
 
@@ -181,6 +245,9 @@ Run `--check` to confirm every PHP binary is on a fixed build. Once you're on th
 - [Disabling session.upload_progress before the php2shell patch lands](https://lilting.ch/en/articles/php2shell-session-upload-progress-uaf)
 - [Assessing and containing php2shell: DeXpose](https://www.dexpose.io/php2shell-php-rce-exposure-response/)
 - [Apache-level multipart blocking toolkit: syhunt/php2shell-protection](https://github.com/syhunt/php2shell-protection)
+- [Sansec: Critical PHP RCE](https://sansec.io/research/php2shell)
+- [Huntress: Rapid Response, php2shell](https://www.huntress.com/blog/php2shell-leaked-critical-php-vulnerabilities)
+- [Vincent Schmalbach: what you should do now](https://www.vincentschmalbach.com/cve-2026-109618-and-cve-2026-109619-what-you-should-do-now/)
 
 ## License
 
