@@ -18,7 +18,7 @@
 
 set -u
 
-VERSION="1.8.0"
+VERSION="1.9.0"
 DIRECTIVE="session.upload_progress.enabled"
 TS="$(date +%Y%m%d-%H%M%S)"
 MODE=fix
@@ -41,6 +41,8 @@ UBUNTU_FIXED="${PHPFIX_UBUNTU_FIXED:-trusty:5.5:5.5.9+dfsg-1ubuntu4.29+esm18 xen
   bionic:7.2:7.2.24-0ubuntu0.18.04.17+esm14 focal:7.4:7.4.3-4ubuntu2.29+esm5 jammy:8.1:8.1.2-1ubuntu2.28
   noble:8.3:8.3.6-0ubuntu0.24.04.13 resolute:8.5:8.5.4-0ubuntu1.5 stonking:8.5:8.5.9-0ubuntu2.1}"
 UBUNTU_USN="USN-8948-1 / USN-8948-2"
+# cPanel EA4 25.91 backports the fix into ea-php74 / 80 / 81 at the same version: branch:first fixed release
+CPANEL_FIXED="${PHPFIX_CPANEL_FIXED:-74:19 80:12 81:5}"
 
 usage() {
   cat <<EOF
@@ -376,6 +378,26 @@ da_build() {
   if [ "$b" -nt "$pf" ]; then echo built; else echo pending; fi
 }
 
+# cpanel_build <binary>: for /opt/cpanel/ea-php74|80|81 binaries, prints "fixed|<release>" or
+# "old|<release>|<fixed release>" from the owning package's release number; nothing otherwise
+cpanel_build() {
+  local b="$1" br rel="" e pkg
+  case "$b" in /opt/cpanel/ea-php[0-9]*/*) ;; *) return 0 ;; esac
+  br="${b#/opt/cpanel/ea-php}"; br="${br%%/*}"
+  if command -v rpm >/dev/null 2>&1 && rpm -qf "$b" >/dev/null 2>&1; then
+    rel="$(rpm -qf --qf '%{RELEASE}\n' "$b" 2>/dev/null | head -1)"
+  elif command -v dpkg >/dev/null 2>&1 && pkg="$(dpkg -S "$b" 2>/dev/null | head -1 | cut -d: -f1)" && [ -n "$pkg" ]; then
+    rel="$(dpkg-query -W -f='${Version}' "$pkg" 2>/dev/null)"; rel="${rel##*-}"
+  fi
+  rel="$(echo "$rel" | grep -oE '^[0-9]+')"
+  [ -n "$rel" ] || return 0
+  for e in $CPANEL_FIXED; do
+    [ "${e%%:*}" = "$br" ] || continue
+    if [ "$rel" -ge "${e#*:}" ]; then echo "fixed|$rel"; else echo "old|$rel|${e#*:}"; fi
+    return 0
+  done
+}
+
 # ---------------------------------------------------------------------------
 # Real SAPI check: ask every running PHP-FPM pool over FastCGI what it sees
 # (php.ini + pool php_admin_* overrides), without curl, cgi-fcgi or files in a web root.
@@ -518,6 +540,9 @@ classify() {
       STATUS=UNPATCHED; NOTE="Ubuntu's fixed build is ${ub##*|} ($UBUNTU_USN): apt upgrade"
       [ "$n" -lt 801 ] && NOTE="$NOTE. Ubuntu 20.04 and older: Ubuntu Pro (ESM) only, sudo pro attach"
     fi
+  elif [ -n "$b" ] && ub="$(cpanel_build "$b")" && [ -n "$ub" ]; then
+    if [ "${ub%%|*}" = fixed ]; then STATUS=PATCHED; NOTE="cPanel EA4 backport (package release ${ub#fixed|}, EA4 25.91)"
+    else STATUS=UNPATCHED; NOTE="cPanel EA4 backport is release ${ub##*|} (EA4 25.91), installed $(echo "$ub" | cut -d'|' -f2): upgrade 'ea-php*'"; fi
   elif [ -n "$b" ] && ub="$(da_build "$b" "${ver%.*}")" && [ -n "$ub" ]; then
     if [ "$ub" = built ]; then STATUS=PATCHED; NOTE="DirectAdmin CustomBuild backport (binary built after the CVE patch)"
     else STATUS=UNPATCHED; NOTE="DirectAdmin CustomBuild has the CVE patch but this binary is older: da build php"; fi
@@ -553,7 +578,8 @@ update_hints() {
   if [ -d /usr/local/cpanel ] || ls -d /opt/cpanel/ea-php* >/dev/null 2>&1; then
     case "$pm" in apt) info "  cPanel EA4 PHP: apt-get update && apt-get install --only-upgrade \$(dpkg-query -W -f='\${binary:Package}\n' 'ea-php*')" ;;
                   *)   info "  cPanel EA4 PHP: ${pm:-dnf} upgrade 'ea-php*'   (or WHM > EasyApache 4; /scripts/upcp)" ;; esac
-    info "    Fixed only once cPanel has published the new ea-phpXY builds; --check above shows what is installed."
+    info "    EA4 25.91 (21 Oct): ea-php82-85 -> 8.2.35 / 8.3.36 / 8.4.27 / 8.5.12; ea-php74 / 80 / 81 backported"
+    info "    at the same version (7.4.33-19, 8.0.30-12, 8.1.34-5). Then restart: /scripts/restartsrv_apache_php_fpm"
   fi
   if [ -d /usr/local/directadmin ]; then
     info "  DirectAdmin CustomBuild compiles PHP itself (distro patches do not apply):"
@@ -563,10 +589,14 @@ update_hints() {
   case "$(. /etc/os-release 2>/dev/null; echo "${ID:-}:${VERSION_CODENAME:-}")" in
     debian:bookworm) info "  Debian 12: php8.2 8.2.35-1~deb12u1 (DLA-4848-1, via the security archive)" ;;
     debian:trixie)   info "  Debian 13: php8.4 8.4.27-1~deb13u1 (DSA-6574-1)" ;;
+    almalinux:*)
+      info "  AlmaLinux: fixes for 8 (php:7.4, php:8.2), 9 (8.0, php:8.2, php:8.3) and 10 (8.3, php8.4) go to the testing repo first,"
+      info "    then production (https://almalinux.org/blog/). Retired streams (8: php:7.2/7.3/8.0, 9: php:8.1) are not in the first round:"
+      info "    dnf module reset php && dnf module enable php:8.2 && dnf distro-sync 'php*'" ;;
     debian:bullseye|debian:buster) info "  Debian $(. /etc/os-release; echo "$VERSION_ID"): no free fix (LTS ended). Upgrade the OS, use packages.sury.org, or paid ELTS." ;;
   esac
   if ls -d /opt/alt/php[0-9]* >/dev/null 2>&1; then
-    info "  CloudLinux alt-php: ${pm:-dnf} upgrade 'alt-php*'   (status: https://cloudlinux.statuspage.io/)"
+    info "  CloudLinux alt-php: ${pm:-dnf} upgrade 'alt-php*'   (rolling out per OS since 21 Oct; status: https://cloudlinux.statuspage.io/)"
   fi
   if [ -d /usr/local/lsws ]; then
     info "  LiteSpeed lsphp: update the lsphpXY packages, then: /usr/local/lsws/bin/lswsctrl restart"
@@ -589,7 +619,8 @@ update_hints() {
     info "  Alpine: apk upgrade"
   fi
   if command -v docker >/dev/null 2>&1 && docker ps --format '{{.Image}}' 2>/dev/null | grep -qi php; then
-    info "  Docker: docker build --pull (or pull the fixed tag), then recreate: docker compose up -d --force-recreate"
+    info "  Docker: official php:8.2.35 / 8.3.36 / 8.4.27 / 8.5.12 tags are out. docker build --pull, then recreate:"
+    info "    docker compose up -d --force-recreate"
   fi
   case "$(ubuntu_codename)" in
     trusty|xenial|bionic|focal)

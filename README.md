@@ -8,6 +8,9 @@ One-line emergency mitigation for **php2shell** (**CVE-2026-109618** / **CVE-202
 > **The fix is out. Update PHP first:** **8.5.12, 8.4.27, 8.3.36 and 8.2.35** (released 21 October 2026). Distro builds may keep the old upstream number with the fix backported, so check your distro's tracker. PHP 8.1 and older get no php.net fix.
 > The PHP team says updating is the only complete mitigation. This script is for the time until you can.
 
+> [!WARNING]
+> **Attacks have started (21 October 2026).** Cloudflare reported early attacks before the patch shipped, watchTowr's honeypots saw exploitation on 21 October, and Patchstack reports active incidents. CISA had not listed the CVEs in KEV at that time. Exploit code is circulating; Tenable warns that some public "PoCs" are unverified and may carry malware, so don't run them on your own machines. CERT-EU (SA 2026-018) and the UK NCSC advise taking internet-facing PHP offline if you can't patch now.
+
 It sets `session.upload_progress.enabled = Off` across every PHP installation on a Linux server: distro packages, control panels, multiple PHP versions, PHP-FPM pools and Apache mod_php. On **unpatched PHP 8.5** it also sets `fatal_error_backtraces = Off`. Then it verifies the result through the CLI and FPM binaries and every running FPM pool. Read-only modes check patch status against the fixed versions (`--check`), sweep for signs of compromise (`--audit`) and print WAF rules for the multipart path (`--waf-print`).
 
 ## What the two bugs are (from the official advisories)
@@ -32,7 +35,7 @@ curl -fsSL https://raw.githubusercontent.com/ersinkoc/php-fix/main/install.sh | 
 Piping `main` into `sudo bash` means trusting whatever is on `main` at that moment. For production, use a release instead. Every release is built by GitHub Actions and ships with a `SHA256SUMS` file and a signed [build provenance attestation](https://docs.github.com/actions/security-for-github-actions/using-artifact-attestations):
 
 ```bash
-V=v1.8.0
+V=v1.9.0
 curl -fsSLO https://github.com/ersinkoc/php-fix/releases/download/$V/install.sh
 curl -fsSLO https://github.com/ersinkoc/php-fix/releases/download/$V/SHA256SUMS
 sha256sum -c SHA256SUMS                                      # integrity
@@ -159,6 +162,7 @@ The tests cover:
 - **`--user-ini`:** writes `.user.ini` as the site user, is idempotent, and is refused as root
 - **PHP 8.5 (stub binary):** `--check` flags `fatal_error_backtraces` On; the fix writes the `conf.d` drop-in only on unpatched 8.5, verifies it, is idempotent, and `--revert` removes it
 - **Fixed versions:** `--check` classifies real distro PHP as PATCHED / UNPATCHED / EOL (Debian trixie ships 8.4.27; Ubuntu 24.04's backported 8.3.6 is detected from its changelog)
+- **cPanel EA4:** an ea-php74 package at release 19 is PATCHED, and an older release says `upgrade 'ea-php*'` (Debian / Ubuntu images, with a stub .deb)
 - **DirectAdmin:** a 7.4 binary built after CustomBuild's CVE patch is PATCHED, and an older one says `da build php`. Imunify360 rulesets older than 8.83 are flagged
 - **Ubuntu:** `--check` recognizes 24.04's `8.3.6-0ubuntu0.24.04.13` as fixed from the USN table, and reports a build older than the table entry as unpatched
 - **After an update:** `--check` reports FPM workers still running a replaced binary, prints update and restart hints, and stops reporting once FPM is restarted. It warns about `memory_limit = -1` left on a patched FPM, but not on CLI, where `-1` is the default
@@ -225,7 +229,7 @@ It compares a multipart POST, a multipart PUT and a mixed-case `Content-Type` ag
 
 Control panels and several repositories ship **their own PHP builds**. `apt upgrade` / `dnf upgrade` doesn't touch Plesk's, cPanel's, DirectAdmin's or CloudLinux's PHP. One server can have several of these side by side. `--check` lists every PHP it finds, detects where each one comes from, and prints the update command for that source.
 
-### Where the fixed builds are (as of 21 October 2026, evening UTC)
+### Where the fixed builds are (as of 21 October 2026, ~19:00 UTC)
 
 This changes hour by hour. Check the vendor's page, then confirm with `--check`.
 
@@ -233,20 +237,23 @@ This changes hour by hour. Check the vendor's page, then confirm with `--check`.
 |---|---|---|---|
 | **php.net** upstream | — | ✅ 8.2.35, 8.3.36, 8.4.27, 8.5.12. Minimal source backports for 7.4, 8.0 and 8.1 are published for vendors | — |
 | **Plesk** (Linux) | `/opt/plesk/php/X.Y` | ✅ all four branches. Windows: in progress | Tools & Settings → Updates, or `plesk installer update` |
-| **cPanel EA4** | `/opt/cpanel/ea-phpXY` | ⏳ not confirmed yet (last release: EA4 25.86, pre-fix) | `dnf upgrade 'ea-php*'` (`yum` on EL7, `apt` on Ubuntu), or `/scripts/upcp` |
+| **cPanel EA4** | `/opt/cpanel/ea-phpXY` | ✅ [EA4 25.91](https://docs.cpanel.net/changelogs/easyapache-4-change-log-25/): ea-php82–85 → 8.2.35 / 8.3.36 / 8.4.27 / 8.5.12. **ea-php74 / 80 / 81 backported at the same version**: `7.4.33-19`, `8.0.30-12`, `8.1.34-5` | `dnf upgrade 'ea-php*'` (`yum` on EL7, `apt` on Ubuntu), or `/scripts/upcp`. Then `/scripts/restartsrv_apache_php_fpm` |
 | **DirectAdmin CustomBuild** | `/usr/local/phpXY` (compiled) | ✅ new DA build on `current` and `stable`: 8.2–8.5 bumped, **7.4 / 8.0 / 8.1 patched at the same version number** (shown with `*`). ⏳ 7.3–5.6 later. 8.1 may fail to build on some systems | `da update && da build php`. PHP is not rebuilt automatically unless the CustomBuild cron is enabled |
-| **CloudLinux alt-php** | `/opt/alt/phpXY` | ⏳ fix in preparation ([status](https://cloudlinux.statuspage.io/), [blog](https://blog.cloudlinux.com/php-cve-2026-109618-and-cve-2026-109619)) | `yum update 'alt-php*'` |
-| **Imunify360** WAF (cPanel, Plesk, CloudLinux) | ModSecurity vendor rules | ✅ ruleset **8.83** blocks the public exploit shape on Apache (LiteSpeed: logs only). One path only, interim | `imunify360-agent update --force modsec-rules`. `--check` reports the installed ruleset version |
+| **CloudLinux alt-php** / **TuxCare ELS** | `/opt/alt/phpXY` | 🔄 rolling out per OS ([status](https://cloudlinux.statuspage.io/)): alt-php74 for EL6–10, Debian 10/11, Ubuntu 16.04–26.04; alt-php80 for EL6–8, Alpine, Debian 10/11; alt-php81 for Alpine. TuxCare ELS php for CentOS 8.4/8.5 ELS, Ubuntu 16.04/18.04 ELS, AlmaLinux 9.2/9.6 ESU. Newer alt-php branches: check the status page | `yum update 'alt-php*'` |
+| **Imunify360** WAF (cPanel, Plesk, CloudLinux) | ModSecurity vendor rules | ✅ ruleset **8.83** blocks the public exploit shape on Apache (LiteSpeed: logs only); 8.84 / 8.85 followed, and scanning IPs get a CAPTCHA. Interim only | `imunify360-agent update --force modsec-rules`. `--check` reports the installed ruleset version |
+| **Cloudflare** WAF | edge | ✅ temporary rules for the known exploit vectors, for all plans including Free. Only covers traffic that goes through Cloudflare; the CTO calls it "a STOPGAP only" | nothing to do; lock the origin to Cloudflare IPs, or the rules can be bypassed |
+| **Check Point** IPS / WAF | gateway | ✅ IPS protection CPAI-2026-15172 | set new critical protections to Prevent. TLS traffic must be inspected |
 | **packages.sury.org** (Debian 12/13, Ubuntu 22.04/24.04) | `/etc/php/X.Y` | ✅ 8.2–8.5, amd64 and arm64 | `apt-get install --only-upgrade 'php8.3*'` |
 | **ppa:ondrej/php** (Launchpad) | `/etc/php/X.Y` | ⏳ lags behind sury.org | wait, or switch to packages.sury.org |
 | **Ubuntu** own packages | `/etc/php/X.Y` | ✅ every release, including ESM ([USN-8948-1 / -2](https://ubuntu.com/blog/php2shell-vulnerability-fixes-available)). See [Ubuntu](#ubuntu) below | `apt upgrade` |
 | **Debian** own packages | `/etc/php/X.Y` | ✅ 13 trixie `8.4.27-1~deb13u1` ([DSA-6574-1](https://security-tracker.debian.org/tracker/CVE-2026-109618)), ✅ 12 bookworm `8.2.35-1~deb12u1` (DLA-4848-1). ⏳ forky / sid. 11: no free fix | `apt upgrade` |
-| **RHEL / Alma / Rocky** AppStream | `/etc/php.ini` | ⏳ no RHSA confirmed on access.redhat.com yet | `dnf upgrade 'php*'`, `dnf updateinfo list --security` |
+| **RHEL / Rocky** AppStream | `/etc/php.ini` | ⏳ no RHSA confirmed on access.redhat.com yet | `dnf upgrade 'php*'`, `dnf updateinfo list --security` |
+| **AlmaLinux** | `/etc/php.ini` | 🔄 [building ahead of RHEL](https://almalinux.org/blog/2026-10-21-php2shell-cve-2026-109618-cve-2026-109619/): 8 (php:7.4, php:8.2), 9 (default 8.0, php:8.2, php:8.3), 10 (default 8.3, php8.4). Testing repo first, then production. Retired streams (8: php:7.2 / 7.3 / 8.0, 9: php:8.1) are not in the first round | `dnf upgrade 'php*'` once released; move off a retired stream with `dnf module reset php && dnf module enable php:8.2 && dnf distro-sync 'php*'` |
 | **Remi** | `/etc/opt/remi`, `/opt/remi` | ❌ not on 21 Oct (expected around 22 Oct, unconfirmed). PHP advises distro packages or a source build. The earlier 8.4.27RC1 / 8.5.12RC1 builds do **not** contain the fix | `dnf upgrade 'php*'` once it's there |
-| **Docker `php` image** | inside the image | ⏳ [docker-library/php#1694](https://github.com/docker-library/php/pull/1694) merged; tags appear once the official-images build finishes. `*RC1` tags don't contain the fix | `docker build --pull`, then `docker compose up -d --force-recreate`. Check with `docker run --rm php:8.4-fpm php -v` |
+| **Docker `php` image** | inside the image | ✅ `8.2.35`, `8.3.36`, `8.4.27`, `8.5.12` tags on Docker Hub (from 21 Oct, ~17:30 UTC). `*RC1` tags don't contain the fix | `docker build --pull`, then `docker compose up -d --force-recreate`. Check with `docker run --rm php:8.4-fpm php -v` |
 | Gentoo / Arch / windows.php.net | — | ✅ (Arch: 8.3, 8.5) | package manager / download |
 
-**Backports keep the old version number.** Ubuntu's `8.3.6-0ubuntu0.24.04.13` is fixed even though it says 8.3.6. `--check` compares Ubuntu's own builds with the USN table below (`dpkg --compare-versions`), and reads the package changelog for the CVE ids on other distros. Debian and sury changelogs may not list the CVEs, but their upstream numbers (8.2.35, 8.4.27 and so on) are new enough. **DirectAdmin** patches 7.4 / 8.0 / 8.1 without changing the version number: `--check` reports those as PATCHED when the binary was built after CustomBuild's CVE patch, and tells you to run `da build php` when it wasn't.
+**Backports keep the old version number.** Ubuntu's `8.3.6-0ubuntu0.24.04.13` is fixed even though it says 8.3.6. `--check` compares Ubuntu's own builds with the USN table below (`dpkg --compare-versions`), and reads the package changelog for the CVE ids on other distros. Debian and sury changelogs may not list the CVEs, but their upstream numbers (8.2.35, 8.4.27 and so on) are new enough. **DirectAdmin** patches 7.4 / 8.0 / 8.1 without changing the version number: `--check` reports those as PATCHED when the binary was built after CustomBuild's CVE patch, and tells you to run `da build php` when it wasn't. **cPanel** does the same for ea-php74 / 80 / 81: `--check` reads the package release (`7.4.33-19` and up is fixed).
 
 ### Ubuntu
 
@@ -403,6 +410,12 @@ Timeline note: the fix and advisories are public, so the patch diff now shows at
 - [CloudLinux: Imunify360 ruleset 8.83](https://blog.cloudlinux.com/php-cve-2026-109618-and-cve-2026-109619)
 - [docker-library/php#1694](https://github.com/docker-library/php/pull/1694)
 - [NCSC-NL php2shell operational info](https://github.com/NCSC-NL/php2shell)
+- [cPanel EasyApache 4 change log (25.91)](https://docs.cpanel.net/changelogs/easyapache-4-change-log-25/)
+- [AlmaLinux: php2shell patches in progress](https://almalinux.org/blog/2026-10-21-php2shell-cve-2026-109618-cve-2026-109619/)
+- [BleepingComputer: PHP ships emergency patches (Cloudflare early attacks)](https://www.bleepingcomputer.com/news/security/php-ships-emergency-patches-for-critical-php2shell-flaws/)
+- [watchTowr FAQ](https://watchtowr.com/intelligence/php-cve-2026-109618-faq/)
+- [Check Point: what we know (IPS CPAI-2026-15172)](https://blog.checkpoint.com/security/php2shell-what-we-know-about-the-leaked-critical-php-vulnerabilities-cve-2026-109618-cve-2026-109619)
+- [SOCRadar: exploitation claims and hunting](https://socradar.io/blog/php2shell-cve-2026-109618-cve-2026-109619/)
 - [CloudLinux status](https://cloudlinux.statuspage.io/)
 - [PHP-UP-2026: pre-release write-up (heap UAF in session upload progress)](https://jackalsyn.com/posts/php-up-2026.html)
 - [php2shell overview: SecureLayer7](https://blog.securelayer7.net/php-rce-cve-2026-109618-109619/)

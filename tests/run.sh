@@ -252,6 +252,21 @@ bash $S --check 2>&1 | grep -q 'php74/bin/php (cli 7.4.33): UNPATCHED.*da build 
   && pass "DA: binary older than the CVE patch says da build php" || fail "DA pending build not reported"
 rm -rf /usr/local/php74 /usr/local/directadmin
 
+if command -v dpkg-deb >/dev/null; then
+  echo "== --check: cPanel EA4 backport (same version, package release 19)"
+  PK=/tmp/ea-php74-pkg
+  mkdir -p "$PK/DEBIAN" "$PK/opt/cpanel/ea-php74/root/usr/bin"
+  printf '#!/bin/sh\ncase "$2" in *PHP_VERSION*) echo 7.4.33;; *) echo;; esac\n' > "$PK/opt/cpanel/ea-php74/root/usr/bin/php"
+  chmod +x "$PK/opt/cpanel/ea-php74/root/usr/bin/php"
+  printf 'Package: ea-php74-php-cli\nVersion: 7.4.33-19.cpanel\nArchitecture: all\nMaintainer: test <t@t>\nDescription: stub\n' > "$PK/DEBIAN/control"
+  dpkg-deb -b "$PK" /tmp/ea-php74.deb >/dev/null 2>&1 && dpkg -i /tmp/ea-php74.deb >/dev/null 2>&1
+  bash $S --check 2>&1 | grep -q 'ea-php74/root/usr/bin/php (cli 7.4.33): PATCHED.*cPanel EA4 backport (package release 19' \
+    && pass "cPanel: ea-php74 release 19 is PATCHED" || fail "cPanel backport not recognised"
+  PHPFIX_CPANEL_FIXED="74:20" bash $S --check 2>&1 | grep -q "ea-php74/root/usr/bin/php (cli 7.4.33): UNPATCHED.*release 20 (EA4 25.91), installed 19: upgrade 'ea-php\*'" \
+    && pass "cPanel: an older ea-php74 release is UNPATCHED" || fail "old cPanel release not reported"
+  dpkg -r ea-php74-php-cli >/dev/null 2>&1; rm -rf "$PK" /tmp/ea-php74.deb; rmdir -p /opt/cpanel/ea-php74/root/usr/bin 2>/dev/null
+fi
+
 echo "== --check: Imunify360 WAF ruleset version"
 IMV=/etc/apache2/conf.d/modsec_vendor_configs/imunify360-full-apache
 mkdir -p "$IMV" && echo 8.82 > "$IMV/VERSION"
