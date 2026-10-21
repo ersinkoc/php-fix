@@ -68,9 +68,12 @@ case "$REVERT_TS" in ''|[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]-[0-9][0-9][0-9]
   *) echo "--revert expects a stamp like 20261021-120000"; exit 1 ;; esac
 
 if [ -t 1 ]; then G='\033[0;32m'; Y='\033[1;33m'; R='\033[0;31m'; N='\033[0m'; else G=''; Y=''; R=''; N=''; fi
-ok()   { echo -e "${G}[OK]${N} $*"; }
-info() { echo -e "${Y}[..]${N} $*"; }
-err()  { echo -e "${R}[!!]${N} $*"; }
+# Messages carry file names, process args and log fields an attacker may control:
+# print them literally and strip control characters (no terminal escape / fake-line injection).
+clean() { printf '%s' "$*" | tr -d '\000-\010\012-\037\177'; }
+ok()   { printf "${G}[OK]${N} %s\n" "$(clean "$*")"; }
+info() { printf "${Y}[..]${N} %s\n" "$(clean "$*")"; }
+err()  { printf "${R}[!!]${N} %s\n" "$(clean "$*")"; }
 
 # Expands to the array contents, or nothing if empty (safe under `set -u` on bash < 4.4, e.g. CentOS 7)
 # usage: for x in ${ARR[@]+"${ARR[@]}"}; do ...
@@ -82,6 +85,8 @@ if [ "$MODE" = waf ]; then
   cat <<'EOF'
 # php2shell: WAF / proxy rules for the multipart path.
 # NOTHING has been changed. Review, adapt the upload allowlist to your apps, test on staging.
+# Allowlist entries are EXACT script paths (anchored with ^...$). Never use prefixes like
+# ^/upload: they also match /upload-anything.php. Every allowlisted path stays exposed.
 
 ############ ModSecurity (v2 / v3) — narrow, safe for almost every site ############
 # Blocks requests carrying the upload-progress field (session.upload_progress.name,
@@ -92,7 +97,7 @@ SecRule ARGS_NAMES "@streq PHP_SESSION_UPLOAD_PROGRESS" \
 ############ ModSecurity — broad: multipart only on allowlisted paths ############
 SecRule REQUEST_HEADERS:Content-Type "@rx (?i)^multipart/form-data" \
   "id:1026110,phase:1,deny,status:403,log,msg:'php2shell multipart outside allowlist',chain"
-  SecRule REQUEST_FILENAME "!@rx ^/(wp-admin/async-upload\.php|wp-admin/media-new\.php|upload)" ""
+  SecRule REQUEST_FILENAME "!@rx ^/(wp-admin/async-upload\.php|wp-admin/media-new\.php)$" ""
 
 ############ nginx — multipart only on allowlisted paths ############
 # http {} context:
@@ -102,25 +107,26 @@ map "$request_method:$http_content_type" $php2shell_mp {
 }
 map $uri $php2shell_upload_ok {
     default 0;
-    ~^/(wp-admin/async-upload\.php|wp-admin/media-new\.php|upload) 1;
+    ~^/(wp-admin/async-upload\.php|wp-admin/media-new\.php)$ 1;
 }
 # inside every `location ~ \.php$ { ... }`:
 #   set $php2shell "$php2shell_mp$php2shell_upload_ok";
 #   if ($php2shell = "10") { return 403; }
 
 ############ Apache 2.4 (no ModSecurity) — multipart only on allowlisted paths ############
-# Put in the server config or a vhost (needs mod_rewrite):
+# Put inside EACH <VirtualHost> (needs mod_rewrite). Rewrite rules in the main server config
+# are NOT inherited by vhosts unless the vhost has `RewriteOptions Inherit`.
 <IfModule mod_rewrite.c>
     RewriteEngine On
     RewriteCond %{REQUEST_METHOD} =POST
     RewriteCond %{HTTP:Content-Type} ^multipart/form-data [NC]
-    RewriteCond %{REQUEST_URI} !^/(wp-admin/async-upload\.php|wp-admin/media-new\.php|upload) [NC]
+    RewriteCond %{REQUEST_URI} !^/(wp-admin/async-upload\.php|wp-admin/media-new\.php)$ [NC]
     RewriteRule ^ - [F]
 </IfModule>
 
 ############ Cloudflare (WAF custom rule expression, action: Block) ############
 # (http.request.method eq "POST" and any(http.request.headers["content-type"][*] contains "multipart/form-data")
-#  and not starts_with(http.request.uri.path, "/wp-admin/async-upload.php"))
+#  and not http.request.uri.path in {"/wp-admin/async-upload.php" "/wp-admin/media-new.php"})
 EOF
   exit 0
 fi
@@ -296,7 +302,7 @@ if [ "$MODE" = audit ]; then
       \( -name '*.php' -o -name '*.phtml' -o -name '*.phar' -o -name '.user.ini' -o -name '.htaccess' \) \
       -mmin "-$MIN" 2>/dev/null)
     info "Changed PHP/.htaccess/.user.ini files in web roots: ${#RECENT[@]} (first 20 below, review if unexpected)"
-    [ ${#RECENT[@]} -gt 0 ] && printf '     %s\n' "${RECENT[@]:0:20}"
+    for f in ${RECENT[@]+"${RECENT[@]:0:20}"}; do printf '     %s\n' "$(clean "$f")"; done
 
     # 2) Webshell-like patterns in those files
     if [ ${#RECENT[@]} -gt 0 ]; then
@@ -350,7 +356,7 @@ if [ "$MODE" = audit ]; then
   if [ ${#LOGS[@]} -gt 0 ]; then
     info "Top POST-to-.php clients in current access logs (last 200k lines per file, context only):"
     for l in "${LOGS[@]}"; do "${NICE[@]}" tail -n 200000 "$l" 2>/dev/null; done \
-      | awk '$6 ~ /"POST/ && $7 ~ /\.php/ {print $1}' | sort | uniq -c | sort -rn | head -10 | sed 's/^/     /'
+      | awk '$6 ~ /"POST/ && $7 ~ /\.php/ {print $1}' | tr -d '\000-\011\013-\037\177' | sort | uniq -c | sort -rn | head -10 | sed 's/^/     /'
   fi
 
   # 8) PHP containers: this script does not reach inside them

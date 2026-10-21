@@ -9,6 +9,9 @@ PASS=0; FAIL=0
 pass() { echo "PASS: $*"; PASS=$((PASS+1)); }
 fail() { echo "FAIL: $*"; FAIL=$((FAIL+1)); }
 same() { [ "$(sha256sum < "$1")" = "$(sha256sum < "$2")" ]; }
+# apachectl start/stop return before the server is really up/down: wait on the port
+a_start() { apache2ctl start >/dev/null 2>&1; for _ in $(seq 50); do curl -s -o /dev/null localhost/ && return; sleep 0.2; done; }
+a_stop()  { apache2ctl stop >/dev/null 2>&1; for _ in $(seq 50); do curl -s -o /dev/null localhost/ || return; sleep 0.2; done; }
 expect_rc() { local want="$1" got="$2" what="$3"; [ "$got" = "$want" ] && pass "$what (rc=$got)" || fail "$what (rc=$got, want $want)"; }
 
 echo "== Installing PHP"
@@ -59,10 +62,26 @@ if [ "$MODPHP" = 1 ]; then
   sed -i "/<Directory \/var\/www\/>/,/<\/Directory>/ s/AllowOverride None/AllowOverride All/" /etc/apache2/apache2.conf
   echo '<?php var_export(ini_get("session.upload_progress.enabled"));' > /var/www/html/t.php
   echo 'php_flag session.upload_progress.enabled on' > /var/www/html/.htaccess
-  apache2ctl start >/dev/null 2>&1; sleep 1
+  a_start
   r="$(curl -s localhost/t.php)"
   [ "$r" = "'0'" ] && pass ".htaccess cannot re-enable (got $r)" || fail ".htaccess re-enabled it (got $r)"
-  apache2ctl stop >/dev/null 2>&1
+  a_stop
+
+  echo "== --waf-print Apache rule: valid config, blocks multipart outside the exact allowlist"
+  a2enmod -q rewrite >/dev/null 2>&1
+  # Paste the snippet verbatim inside the vhost, as the instructions say
+  VH=/etc/apache2/sites-enabled/000-default.conf; cp "$VH" /root/vhost.orig
+  bash $S --waf-print | sed -n '/^<IfModule mod_rewrite.c>/,/^<\/IfModule>/p' > /root/waf.snip
+  sed -i '/<\/VirtualHost>/e cat /root/waf.snip' "$VH"
+  apache2ctl -t >/dev/null 2>&1 && pass "waf Apache snippet passes configtest" || fail "waf Apache snippet breaks config"
+  a_start
+  mp() { curl -s -o /dev/null -w '%{http_code}' -F a=b "localhost$1"; }
+  [ "$(mp /t.php)" = 403 ] && pass "multipart to /t.php blocked" || fail "multipart to /t.php not blocked ($(mp /t.php))"
+  [ "$(mp /wp-admin/async-upload.php-evil.php)" = 403 ] && pass "prefix trick blocked" || fail "prefix trick not blocked"
+  [ "$(mp /wp-admin/async-upload.php)" != 403 ] && pass "allowlisted path passes" || fail "allowlisted path blocked"
+  [ "$(curl -s -o /dev/null -w '%{http_code}' -d a=b localhost/t.php)" = 200 ] && pass "normal POST passes" || fail "normal POST blocked"
+  a_stop
+  cp /root/vhost.orig "$VH"
 fi
 
 echo "== --check"
@@ -77,6 +96,13 @@ out="$(bash $S --audit 2>&1)"; rc=$?
 expect_rc 3 "$rc" "audit flags findings"
 echo "$out" | grep -q 'Webshell-like code: /var/www/html/shell.php' && pass "audit names the webshell" || fail "audit missed webshell"
 rm -f /var/www/html/shell.php
+
+echo "== --audit output cannot carry terminal escapes"
+evil="/var/www/html/$(printf 'x\033[2J\033[1A[OK] clean')"
+echo '<?php system($_GET["c"]);' > "$evil"
+out="$(bash $S --audit 2>&1)"
+printf '%s' "$out" | grep -q "$(printf '\033')\[2J" && fail "escape sequence reached the terminal" || pass "escape sequences stripped"
+rm -f "$evil"
 
 echo "== stub binaries: EOL and < 5.4"
 printf '#!/bin/sh\ncase "$2" in *PHP_VERSION*) echo 7.4.33;; *) echo;; esac\n' > /usr/bin/php74; chmod +x /usr/bin/php74

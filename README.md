@@ -109,6 +109,11 @@ The tests cover:
 - dry-run changes nothing; php.ini, `conf.d` and FPM pool overrides are fixed; a second run is idempotent
 - **`.htaccess` with `php_flag … on` cannot re-enable the setting under mod_php** (a real HTTP request returns `'0'`)
 - `--check`, and `--audit` catching a planted webshell
+- `--audit` output stays clean when a malicious file name carries terminal escape sequences
+- the `--waf-print` Apache rule, pasted into a vhost, passes `apachectl -t` and behaves as intended:
+  - a multipart POST to `/t.php` gets `403`
+  - the prefix trick `/wp-admin/async-upload.php-evil.php` is blocked
+  - the allowlisted path and normal POSTs pass
 - the EOL warning and the `< 5.4` exit `2` path
 - `--revert` restores php.ini byte-for-byte and leaves Apache valid
 - world-writable directories are refused
@@ -145,7 +150,7 @@ For the real web SAPI, including FPM pool settings, put `<?php var_export(ini_ge
 
 ## Not covered (check these yourself)
 
-- **The second bug path (multipart parser).** For defense in depth until you patch, run `--waf-print` and apply the rules that fit your setup. The narrow ModSecurity rule (blocks only the upload-progress field) is safe for almost every site. The broad "multipart only on allowlisted paths" rules need your real upload URLs first. Also see [syhunt/php2shell-protection](https://github.com/syhunt/php2shell-protection).
+- **The second bug path (multipart parser).** For defense in depth until you patch, run `--waf-print` and apply the rules that fit your setup. The narrow ModSecurity rule (blocks only the upload-progress field) is safe for almost every site. The broad "multipart only on allowlisted paths" rules need your real upload URLs first. List **exact script paths** anchored with `^…$`, never prefixes like `^/upload` (that also matches `/upload-anything.php`). The Apache rule goes inside each `<VirtualHost>`. Also see [syhunt/php2shell-protection](https://github.com/syhunt/php2shell-protection).
 - **`.user.ini` with PHP-CGI / LiteSpeed (non-FPM).** The setting is `PHP_INI_PERDIR`, so a site can turn it back on. `--audit` reports these files.
 - **Docker images.** Configure them in the image instead, e.g. add `RUN echo 'session.upload_progress.enabled=Off' > /usr/local/etc/php/conf.d/zz-php2shell.ini` and rebuild. `--audit` lists running PHP containers.
 - **Windows / IIS.** Not supported.
