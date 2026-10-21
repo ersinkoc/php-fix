@@ -15,7 +15,7 @@
 
 set -u
 
-VERSION="1.2.1"
+VERSION="1.2.2"
 DIRECTIVE="session.upload_progress.enabled"
 TS="$(date +%Y%m%d-%H%M%S)"
 MODE=fix
@@ -72,9 +72,11 @@ if [ -t 1 ]; then G='\033[0;32m'; Y='\033[1;33m'; R='\033[0;31m'; N='\033[0m'; e
 # print them literally and strip control characters (no terminal escape / fake-line injection).
 # Drops invalid UTF-8 (incl. lone 8-bit C1 bytes like 0x9B = CSI), UTF-8 encoded C1 (U+0080-U+009F),
 # then C0 controls and DEL. Without iconv, keep printable ASCII only.
+# The C1 pattern is built from real bytes, so it doesn't depend on sed's \x escape support.
+C1_RE="$(printf '\302[\200-\237]')"
 if command -v iconv >/dev/null 2>&1; then
   clean() { printf '%s' "$*" | iconv -c -f UTF-8 -t UTF-8 2>/dev/null \
-    | LC_ALL=C sed 's/\xc2[\x80-\x9f]//g' | LC_ALL=C tr -d '\000-\010\012-\037\177'; }
+    | LC_ALL=C sed "s/$C1_RE//g" | LC_ALL=C tr -d '\000-\010\012-\037\177'; }
 else
   clean() { printf '%s' "$*" | LC_ALL=C tr -cd '\011\040-\176'; }
 fi
