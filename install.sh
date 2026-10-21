@@ -136,7 +136,53 @@ if [ ${#existing_roots[@]} -gt 0 ]; then
   done
 fi
 
-# 4) Reload services
+# 4) mod_php: global php_admin_flag so .htaccess cannot turn it back on
+APACHECTL="$(command -v apachectl || command -v apache2ctl || command -v httpd || true)"
+MODPHP_CONF=""
+if [ -n "$APACHECTL" ] && { "$APACHECTL" -M 2>/dev/null | grep -Eiq '^[[:space:]]*php[0-9]*_module' \
+     || ls /etc/apache2/mods-enabled/php*.load >/dev/null 2>&1; }; then
+  if [ -d /etc/apache2/conf-available ] && command -v a2enconf >/dev/null 2>&1; then
+    MODPHP_CONF=/etc/apache2/conf-available/zz-php2shell.conf     # Debian / Ubuntu
+  elif [ -d /etc/httpd/conf.d ]; then
+    MODPHP_CONF=/etc/httpd/conf.d/zz-php2shell.conf               # RHEL family
+  elif [ -d /etc/apache2/conf.d ]; then
+    MODPHP_CONF=/etc/apache2/conf.d/zz-php2shell.conf             # cPanel EA4
+  else
+    err "mod_php detected but no Apache conf.d directory found; add php_admin_flag ${DIRECTIVE} off manually"
+  fi
+fi
+if [ -n "$MODPHP_CONF" ]; then
+  MODPHP_BODY="# php-fix: php2shell (CVE-2026-109618 / CVE-2026-109619) mitigation
+# php_admin_flag cannot be overridden from .htaccess
+<IfModule php_module>
+    php_admin_flag ${DIRECTIVE} off
+</IfModule>
+<IfModule php7_module>
+    php_admin_flag ${DIRECTIVE} off
+</IfModule>
+<IfModule php5_module>
+    php_admin_flag ${DIRECTIVE} off
+</IfModule>"
+  if [ -f "$MODPHP_CONF" ] && [ "$(cat "$MODPHP_CONF")" = "$MODPHP_BODY" ]; then
+    ok "mod_php admin flag already present: $MODPHP_CONF"
+  elif [ "$DRY_RUN" -eq 1 ]; then
+    info "[dry-run] Would write mod_php admin flag: $MODPHP_CONF"
+  elif [ -L "$MODPHP_CONF" ]; then
+    err "Refusing to write through symlink: $MODPHP_CONF"; FAILED=$((FAILED+1))
+  else
+    printf '%s\n' "$MODPHP_BODY" > "$MODPHP_CONF"
+    case "$MODPHP_CONF" in /etc/apache2/conf-available/*) a2enconf -q zz-php2shell >/dev/null 2>&1 ;; esac
+    if "$APACHECTL" -t >/dev/null 2>&1; then
+      ok "Wrote mod_php admin flag: $MODPHP_CONF"; CHANGED=$((CHANGED+1))
+    else
+      case "$MODPHP_CONF" in /etc/apache2/conf-available/*) a2disconf -q zz-php2shell >/dev/null 2>&1 ;; esac
+      rm -f "$MODPHP_CONF"
+      err "Apache config test failed with $MODPHP_CONF, removed it again"; FAILED=$((FAILED+1))
+    fi
+  fi
+fi
+
+# 5) Reload services
 if [ "$DRY_RUN" -eq 0 ] && [ "$NO_RESTART" -eq 0 ] && [ "$CHANGED" -gt 0 ]; then
   info "Reloading PHP / web services..."
   if command -v systemctl >/dev/null 2>&1; then
@@ -154,7 +200,28 @@ if [ "$DRY_RUN" -eq 0 ] && [ "$NO_RESTART" -eq 0 ] && [ "$CHANGED" -gt 0 ]; then
   pkill -f lsphp >/dev/null 2>&1 && ok "Killed lsphp processes (LiteSpeed will respawn them)"
 fi
 
-# 5) Verify via CLI binaries
+# 6) Verify via CLI and FPM binaries (each loads its own php.ini)
+LEGACY=0; EOL=0
+# check_result <binary> <sapi> <PHP_VERSION> <effective value>
+check_result() {
+  local b="$1" sapi="$2" ver="$3" v="$4" ma mi
+  IFS=. read -r ma mi _ <<< "$ver"
+  case "$ma$mi" in *[!0-9]*|'') err "$b: could not read PHP version"; FAILED=$((FAILED+1)); return ;; esac
+  if [ $((ma*100+mi)) -lt 504 ]; then
+    err "$b ($sapi $ver): NOT PROTECTED. ${DIRECTIVE} does not exist before PHP 5.4, but the multipart parser is still exposed."
+    err "    Upgrade PHP, or block multipart/form-data POSTs at the proxy/WAF."
+    LEGACY=1; return
+  fi
+  case "$(echo "$v" | tr 'A-Z' 'a-z')" in
+    ''|0|off|false|no|none) ok "$b ($sapi $ver): Off" ;;
+    *) err "$b ($sapi $ver): STILL ON ($v)"; FAILED=$((FAILED+1)) ;;
+  esac
+  if [ $((ma*100+mi)) -lt 802 ]; then
+    err "    EOL branch: an official patch is unlikely. Block/limit multipart POSTs at the proxy/WAF and plan an upgrade."
+    EOL=1
+  fi
+}
+
 info "Verification:"
 mapfile -t PHP_BINS < <(
   {
@@ -167,18 +234,38 @@ mapfile -t PHP_BINS < <(
 for b in ${PHP_BINS[@]+"${PHP_BINS[@]}"}; do
   ver="$("$b" -r 'echo PHP_VERSION;' 2>/dev/null)" || continue
   v="$("$b" -r "echo ini_get('${DIRECTIVE}');" 2>/dev/null)"
-  if [ -z "$v" ] || [ "$v" = "0" ]; then ok "$b ($ver): Off"
-  else err "$b ($ver): STILL ON ($v)"; FAILED=$((FAILED+1)); fi
+  check_result "$b" cli "$ver" "$v"
 done
+
+mapfile -t FPM_BINS < <(
+  ls /usr/sbin/php-fpm* /usr/local/sbin/php-fpm /opt/cpanel/ea-php*/root/usr/sbin/php-fpm \
+     /opt/remi/php*/root/usr/sbin/php-fpm /opt/alt/php*/usr/sbin/php-fpm /opt/plesk/php/*/sbin/php-fpm \
+     /www/server/php/*/sbin/php-fpm /usr/local/php*/sbin/php-fpm 2>/dev/null \
+  | while read -r b; do [ -x "$b" ] && readlink -f "$b"; done | sort -u
+)
+for b in ${FPM_BINS[@]+"${FPM_BINS[@]}"}; do
+  ver="$("$b" -v 2>/dev/null | awk 'NR==1{print $2}')"
+  [ -n "$ver" ] || continue
+  v="$("$b" -i 2>/dev/null | awk -F' => ' -v d="$DIRECTIVE" '$1==d{print $2; exit}')"
+  check_result "$b" fpm "$ver" "$v"
+done
+[ ${#FPM_BINS[@]} -gt 0 ] && info "FPM pool overrides are enforced via php_admin_flag (step 3); php-fpm -i shows php.ini values only."
 
 echo
 echo "Changed: $CHANGED | Already Off: $SKIPPED | Errors: $FAILED"
 if [ "$DRY_RUN" -eq 1 ]; then
   info "Dry run finished, nothing was changed."
-elif [ "$FAILED" -eq 0 ]; then
-  echo -e "${G}DONE ✔ ${DIRECTIVE} = Off${N}"
-  echo "Reminder: this is a stopgap. Upgrade PHP to the patched release as soon as possible."
-else
+  [ "$LEGACY" -eq 1 ] && exit 2
+  exit 0
+fi
+if [ "$FAILED" -gt 0 ]; then
   err "Some steps failed, check the output above."
   exit 1
 fi
+if [ "$LEGACY" -eq 1 ]; then
+  err "PHP < 5.4 found: this mitigation does NOT protect it. See the warnings above."
+  exit 2
+fi
+echo -e "${G}DONE ✔ ${DIRECTIVE} = Off${N}"
+[ "$EOL" -eq 1 ] && err "EOL PHP versions found: they will likely get no patch. See the warnings above."
+echo "Reminder: this is a stopgap. Upgrade PHP to the patched release as soon as possible."
