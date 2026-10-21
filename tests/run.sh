@@ -231,6 +231,15 @@ for w in 'Plesk PHP' 'cPanel EA4 PHP' 'DirectAdmin CustomBuild' 'CloudLinux alt-
 done
 rmdir /usr/local/psa /opt/cpanel/ea-php83 /opt/cpanel /usr/local/directadmin /opt/alt/php83 /opt/alt 2>/dev/null
 
+if grep -q '^ID=ubuntu' /etc/os-release; then
+  echo "== --check: Ubuntu fixed builds (USN-8948)"
+  bash $S --check 2>&1 | grep -q 'php8.3 (cli 8.3.6): PATCHED.*Ubuntu fixed build 8.3.6-0ubuntu0.24.04.[0-9]* (USN-8948' \
+    && pass "--check matches the Ubuntu build against USN-8948" || fail "Ubuntu fixed build not recognised"
+  PHPFIX_UBUNTU_FIXED="noble:8.3:8.3.6-0ubuntu0.24.04.999" bash $S --check 2>&1 \
+    | grep -q "php8.3 (cli 8.3.6): UNPATCHED.*Ubuntu's fixed build is 8.3.6-0ubuntu0.24.04.999" \
+    && pass "--check reports an Ubuntu build older than the USN as unpatched" || fail "old Ubuntu build not reported"
+fi
+
 echo "== --check knows the fixed versions"
 out="$(bash $S --check 2>&1)"
 echo "$out" | grep -Eq '(PATCHED|EOL), mitigation' && ! echo "$out" | grep -q 'fixed versions not known' && pass "--check classifies against the fixed versions" || fail "--check still unknown"

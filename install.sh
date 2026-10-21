@@ -18,7 +18,7 @@
 
 set -u
 
-VERSION="1.6.0"
+VERSION="1.7.0"
 DIRECTIVE="session.upload_progress.enabled"
 TS="$(date +%Y%m%d-%H%M%S)"
 MODE=fix
@@ -34,6 +34,13 @@ JSON=0
 # From GHSA-w8hw-w9fx-j79w / GHSA-6wmf-4rv5-p3rp (21 Oct 2026).
 PATCHED_VERSIONS="8.2.35 8.3.36 8.4.27 8.5.12"
 CVES="CVE-2026-109618|CVE-2026-109619"
+# Ubuntu's fixed builds keep the old upstream number: codename:branch:fixed package version
+# (USN-8948-1 / USN-8948-2, https://ubuntu.com/blog/php2shell-vulnerability-fixes-available).
+# 20.04 and older: Ubuntu Pro (ESM) only.
+UBUNTU_FIXED="${PHPFIX_UBUNTU_FIXED:-trusty:5.5:5.5.9+dfsg-1ubuntu4.29+esm18 xenial:7.0:7.0.33-0ubuntu0.16.04.16+esm22
+  bionic:7.2:7.2.24-0ubuntu0.18.04.17+esm14 focal:7.4:7.4.3-4ubuntu2.29+esm5 jammy:8.1:8.1.2-1ubuntu2.28
+  noble:8.3:8.3.6-0ubuntu0.24.04.13 resolute:8.5:8.5.4-0ubuntu1.5 stonking:8.5:8.5.9-0ubuntu2.1}"
+UBUNTU_USN="USN-8948-1 / USN-8948-2"
 
 usage() {
   cat <<EOF
@@ -333,6 +340,30 @@ backported() {
   return 1
 }
 
+# Ubuntu release codename, or nothing on other distros
+ubuntu_codename() {
+  [ -r /etc/os-release ] || return 0
+  # shellcheck disable=SC1091
+  (. /etc/os-release; [ "${ID:-}" = ubuntu ] && echo "${VERSION_CODENAME:-}")
+}
+
+# ubuntu_build <binary> <branch X.Y>: for a binary from Ubuntu's own archive (not sury / ondrej),
+# prints "fixed|<installed>" or "old|<installed>|<fixed>"; nothing when the table doesn't apply
+ubuntu_build() {
+  local b="$1" br="$2" cn pkg inst e f
+  cn="$(ubuntu_codename)"
+  [ -n "$cn" ] && command -v dpkg-query >/dev/null 2>&1 || return 0
+  pkg="$(dpkg -S "$b" 2>/dev/null | head -1 | cut -d: -f1)"; [ -n "$pkg" ] || return 0
+  inst="$(dpkg-query -W -f='${Version}' "$pkg" 2>/dev/null)"
+  case "$inst" in *sury*) return 0 ;; *ubuntu*) ;; *) return 0 ;; esac
+  for e in $UBUNTU_FIXED; do
+    [ "${e%%:*}" = "$cn" ] && [ "$(echo "$e" | cut -d: -f2)" = "$br" ] || continue
+    f="${e#*:*:}"
+    if dpkg --compare-versions "$inst" ge "$f"; then echo "fixed|$inst"; else echo "old|$inst|$f"; fi
+    return 0
+  done
+}
+
 # ---------------------------------------------------------------------------
 # Real SAPI check: ask every running PHP-FPM pool over FastCGI what it sees
 # (php.ini + pool php_admin_* overrides), without curl, cgi-fcgi or files in a web root.
@@ -462,13 +493,19 @@ fi
 # ---------------------------------------------------------------------------
 # classify <PHP_VERSION> <effective value> [binary for backport lookup] -> sets STATUS, NOTE, MIT
 classify() {
-  local ver="$1" v="$2" b="${3:-}" n fixed="" p
+  local ver="$1" v="$2" b="${3:-}" n fixed="" p ub=""
   n="$(branch_num "$ver")"
   if [ -z "$n" ]; then STATUS=UNKNOWN; MIT=unknown; NOTE="could not read PHP version"; return; fi
   if is_off "$v" && [ "$n" -ge 504 ]; then MIT=on; else MIT=off; fi
   for p in $PATCHED_VERSIONS; do [ "$(branch_num "$p")" = "$n" ] && fixed="$p"; done
   if [ "$n" -lt 504 ]; then STATUS=LEGACY; MIT=impossible; NOTE="EOL, no patch, and the mitigation cannot apply (< 5.4). Upgrade PHP."
   elif [ -n "$fixed" ] && ver_ge "$ver" "$fixed"; then STATUS=PATCHED; NOTE=">= $fixed"
+  elif [ -n "$b" ] && ub="$(ubuntu_build "$b" "${ver%.*}")" && [ -n "$ub" ]; then
+    if [ "${ub%%|*}" = fixed ]; then STATUS=PATCHED; NOTE="Ubuntu fixed build ${ub#fixed|} ($UBUNTU_USN)"
+    else
+      STATUS=UNPATCHED; NOTE="Ubuntu's fixed build is ${ub##*|} ($UBUNTU_USN): apt upgrade"
+      [ "$n" -lt 801 ] && NOTE="$NOTE. Ubuntu 20.04 and older: Ubuntu Pro (ESM) only, sudo pro attach"
+    fi
   elif [ -n "$b" ] && backported "$b"; then STATUS=PATCHED; NOTE="distro backport (CVE in package changelog)"
   elif [ "$n" -lt 802 ]; then STATUS=EOL; NOTE="EOL upstream: no php.net patch. Your vendor may backport it (RHEL, Ubuntu Pro, Debian LTS, TuxCare, CloudLinux); otherwise upgrade PHP."
   elif [ -n "$fixed" ]; then STATUS=UNPATCHED; NOTE="fixed in $fixed"
@@ -533,9 +570,17 @@ update_hints() {
   if command -v docker >/dev/null 2>&1 && docker ps --format '{{.Image}}' 2>/dev/null | grep -qi php; then
     info "  Docker: docker build --pull (or pull the fixed tag), then recreate: docker compose up -d --force-recreate"
   fi
-  info "  Distro builds keep the old upstream number with the fix backported: --check reads the package changelog."
+  case "$(ubuntu_codename)" in
+    trusty|xenial|bionic|focal)
+      info "  Ubuntu $(ubuntu_codename): the fix is in Ubuntu Pro (ESM) only. sudo pro attach <token> (free for 5 machines), then apt upgrade." ;;
+  esac
+  if [ -n "$(ubuntu_codename)" ] && dpkg-query -W -f='${Status}' unattended-upgrades 2>/dev/null | grep -q 'ok installed'; then
+    info "  unattended-upgrades installs the security update within 24 h, but restarts nothing: restart PHP (or reboot) after it ran."
+  fi
+  info "  Distro builds keep the old upstream number with the fix backported: --check compares Ubuntu builds with"
+  info "    $UBUNTU_USN and reads other distros' package changelogs."
   info "Then restart every PHP worker: FPM (systemctl restart php*-fpm), Apache with mod_php (full restart,"
-  info "  not a graceful reload), LiteSpeed, queue / Octane / long-running PHP workers. Run --check again."
+  info "  not a graceful reload), LiteSpeed, queue / Octane / long-running PHP workers, or reboot. Run --check again."
 }
 
 JSON_ROWS=()

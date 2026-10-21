@@ -32,7 +32,7 @@ curl -fsSL https://raw.githubusercontent.com/ersinkoc/php-fix/main/install.sh | 
 Piping `main` into `sudo bash` means trusting whatever is on `main` at that moment. For production, use a release instead. Every release is built by GitHub Actions and ships with a `SHA256SUMS` file and a signed [build provenance attestation](https://docs.github.com/actions/security-for-github-actions/using-artifact-attestations):
 
 ```bash
-V=v1.6.0
+V=v1.7.0
 curl -fsSLO https://github.com/ersinkoc/php-fix/releases/download/$V/install.sh
 curl -fsSLO https://github.com/ersinkoc/php-fix/releases/download/$V/SHA256SUMS
 sha256sum -c SHA256SUMS                                      # integrity
@@ -159,6 +159,7 @@ The tests cover:
 - **`--user-ini`:** writes `.user.ini` as the site user, is idempotent, and is refused as root
 - **PHP 8.5 (stub binary):** `--check` flags `fatal_error_backtraces` On; the fix writes the `conf.d` drop-in only on unpatched 8.5, verifies it, is idempotent, and `--revert` removes it
 - **Fixed versions:** `--check` classifies real distro PHP as PATCHED / UNPATCHED / EOL (Debian trixie ships 8.4.27; Ubuntu 24.04's backported 8.3.6 is detected from its changelog)
+- **Ubuntu:** `--check` recognizes 24.04's `8.3.6-0ubuntu0.24.04.13` as fixed from the USN table, and reports a build older than the table entry as unpatched
 - **After an update:** `--check` reports FPM workers still running a replaced binary, prints update and restart hints, and stops reporting once FPM is restarted. It warns about `memory_limit = -1` left on a patched FPM, but not on CLI, where `-1` is the default
 - **`--audit` and `--check`:**
   - `--audit` flags a planted webshell, a worker `SIGSEGV` log line, a PHP file in `/tmp`, a reverse-shell command line, and a multipart request answered with `502` in a `Content-Type`-logging access log
@@ -236,14 +237,39 @@ This changes hour by hour. Check the vendor's page, then confirm with `--check`.
 | **CloudLinux alt-php** | `/opt/alt/phpXY` | ⏳ in progress ([status](https://cloudlinux.statuspage.io/)). Imunify360 rules 8.83 add a block rule | `dnf upgrade 'alt-php*'` |
 | **packages.sury.org** (Debian 12/13, Ubuntu 22.04/24.04) | `/etc/php/X.Y` | ✅ 8.2–8.5, amd64 and arm64 | `apt-get install --only-upgrade 'php8.3*'` |
 | **ppa:ondrej/php** (Launchpad) | `/etc/php/X.Y` | ⏳ lags behind sury.org | wait, or switch to packages.sury.org |
-| **Ubuntu** own packages | `/etc/php/X.Y` | ✅ 22.04 `8.1.2-1ubuntu2.28`, 24.04 `8.3.6-0ubuntu0.24.04.13`, 26.04 `8.5.4-0ubuntu1.5`. 20.04: Ubuntu Pro only | `apt upgrade` |
+| **Ubuntu** own packages | `/etc/php/X.Y` | ✅ every release, including ESM ([USN-8948-1 / -2](https://ubuntu.com/blog/php2shell-vulnerability-fixes-available)). See [Ubuntu](#ubuntu) below | `apt upgrade` |
 | **Debian** own packages | `/etc/php/X.Y` | ✅ 13 `8.4.27-1~deb13u1`. ⏳ 12 `8.2.35-1~deb12u1`. 11: no free fix | `apt upgrade` |
 | **RHEL / Alma / Rocky** AppStream | `/etc/php.ini` | ⏳ watch your vendor's errata | `dnf upgrade 'php*'`, `dnf updateinfo list --security` |
 | **Remi** | `/etc/opt/remi`, `/opt/remi` | ❌ not on 21 Oct. PHP advises distro packages or a source build | `dnf upgrade 'php*'` once it's there |
 | **Docker `php` image** | inside the image | ⏳ not yet | `docker build --pull`, then `docker compose up -d --force-recreate` |
 | Gentoo / Arch / windows.php.net | — | ✅ (Arch: 8.3, 8.5) | package manager / download |
 
-**Backports keep the old version number.** Ubuntu's `8.3.6-0ubuntu0.24.04.13` is fixed even though it says 8.3.6. `--check` reads the package changelog for the CVE ids and reports these as PATCHED. Debian and sury changelogs may not list the CVEs, but their upstream numbers (8.2.35, 8.4.27 and so on) are new enough.
+**Backports keep the old version number.** Ubuntu's `8.3.6-0ubuntu0.24.04.13` is fixed even though it says 8.3.6. `--check` compares Ubuntu's own builds with the USN table below (`dpkg --compare-versions`), and reads the package changelog for the CVE ids on other distros. Debian and sury changelogs may not list the CVEs, but their upstream numbers (8.2.35, 8.4.27 and so on) are new enough.
+
+### Ubuntu
+
+Canonical has shipped fixes for every release ([announcement](https://ubuntu.com/blog/php2shell-vulnerability-fixes-available), USN-8948-1 / USN-8948-2):
+
+| Release | Package | Fixed version | Channel |
+|---|---|---|---|
+| 26.10 Stonking | php8.5 | `8.5.9-0ubuntu2.1` | standard |
+| 26.04 LTS Resolute | php8.5 | `8.5.4-0ubuntu1.5` | standard |
+| 24.04 LTS Noble | php8.3 | `8.3.6-0ubuntu0.24.04.13` | standard |
+| 22.04 LTS Jammy | php8.1 | `8.1.2-1ubuntu2.28` | standard |
+| 20.04 LTS Focal | php7.4 | `7.4.3-4ubuntu2.29+esm5` | **Ubuntu Pro (ESM)** |
+| 18.04 LTS Bionic | php7.2 | `7.2.24-0ubuntu0.18.04.17+esm14` | **Ubuntu Pro (ESM)** |
+| 16.04 LTS Xenial | php7.0 | `7.0.33-0ubuntu0.16.04.16+esm22` | **Ubuntu Pro (ESM)** |
+| 14.04 LTS Trusty | php5 | `5.5.9+dfsg-1ubuntu4.29+esm18` | **Ubuntu Pro (ESM)** |
+
+```bash
+apt list '?installed ?name(^php[0-9.]+$)'                                        # what you have
+sudo apt update && sudo apt install --only-upgrade '?name(^php[0-9.]+$)' '?name(^php[0-9.]+-)'
+sudo pro attach <token>     # 20.04 and older only: Ubuntu Pro is free for up to 5 machines
+```
+
+- These are Ubuntu's own builds. **On ondrej/sury packages** (versions with `deb.sury.org`) this table doesn't apply. Those need 8.2.35 / 8.3.36 / 8.4.27 / 8.5.12.
+- **unattended-upgrades** installs the fix within 24 hours, but **doesn't restart PHP**. Restart PHP-FPM and Apache yourself, or reboot. `--check` reports workers that still run the replaced code.
+- `--check` also applies to 20.04 and older: an ESM build at or above the table is PATCHED, and an older one is reported with the `pro attach` hint.
 
 ### Commands
 
@@ -368,7 +394,7 @@ Timeline note: the fix and advisories are public, so the patch diff now shows at
 - [Help Net Security: PHP2Shell patched](https://www.helpnetsecurity.com/2026/10/21/php2shell-php-vulnerabilities-patched-cve-2026-109618-cve-2026-109619/)
 - [Tenable FAQ](https://www.tenable.com/blog/php2shell-cve-2026-109618-cve-2026-109619-frequently-asked-questions-about-critical-php-remote)
 - [Plesk advisory](https://support.plesk.com/hc/en-us/articles/44397729587351-Vulnerability-CVE-2026-109618-and-CVE-2026-109619-Remote-code-execution-in-PHP-shipped-with-Plesk)
-- [Ubuntu: php2shell fixes available](https://ubuntu.com/blog/php2shell-vulnerability-fixes-available)
+- [Ubuntu: php2shell fixes available (USN-8948-1 / USN-8948-2)](https://ubuntu.com/blog/php2shell-vulnerability-fixes-available)
 - [ma.ttias.be: per-repository patch status and restart guide](https://ma.ttias.be/php-cve-2026-109618-patch/)
 - [DirectAdmin forum: Critical PHP updates](https://forum.directadmin.com/threads/critical-php-updates.82726/)
 - [CloudLinux status](https://cloudlinux.statuspage.io/)
