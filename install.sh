@@ -18,7 +18,7 @@
 
 set -u
 
-VERSION="1.9.0"
+VERSION="1.10.0"
 DIRECTIVE="session.upload_progress.enabled"
 TS="$(date +%Y%m%d-%H%M%S)"
 MODE=fix
@@ -590,9 +590,20 @@ update_hints() {
     debian:bookworm) info "  Debian 12: php8.2 8.2.35-1~deb12u1 (DLA-4848-1, via the security archive)" ;;
     debian:trixie)   info "  Debian 13: php8.4 8.4.27-1~deb13u1 (DSA-6574-1)" ;;
     almalinux:*)
-      info "  AlmaLinux: fixes for 8 (php:7.4, php:8.2), 9 (8.0, php:8.2, php:8.3) and 10 (8.3, php8.4) go to the testing repo first,"
-      info "    then production (https://almalinux.org/blog/). Retired streams (8: php:7.2/7.3/8.0, 9: php:8.1) are not in the first round:"
-      info "    dnf module reset php && dnf module enable php:8.2 && dnf distro-sync 'php*'" ;;
+      info "  AlmaLinux: fixed builds for every stream (retired ones too) keep the old number with an .alma.1 suffix,"
+      info "    e.g. 9: php-8.0.30-8.el9_8.alma.1. Until they reach production (8 php:7.4 already has):"
+      info "    dnf install -y almalinux-release-testing && dnf upgrade 'php*' --enablerepo=almalinux-testing"
+      info "    Verify with rpm -q php-common (not php -v). https://almalinux.org/blog/" ;;
+    rhel:*)
+      info "  RHEL: RHSA-2026:87072 fixes php:8.2 on RHEL 9 (php-8.2.35-1.module+el9.8). Other streams: watch"
+      info "    https://access.redhat.com/security/cve/cve-2026-109618 and dnf updateinfo list --security" ;;
+    rocky:*)
+      info "  Rocky Linux follows RHEL errata (RHSA-2026:87072: php:8.2 on 9). Others: dnf updateinfo list --security" ;;
+    amzn:*)
+      info "  Amazon Linux 2023: no fixed PHP package yet (github.com/amazonlinux/amazon-linux-2023/issues/1148)."
+      info "    Watch https://explore.alas.aws.amazon.com/CVE-2026-109618.html; keep this mitigation and the edge rules." ;;
+    alpine:*)
+      info "  Alpine: php83 8.3.36-r0, php84 8.4.27-r0, php85 8.5.12-r0 on 3.24 and edge. Older branches: check secdb.alpinelinux.org" ;;
     debian:bullseye|debian:buster) info "  Debian $(. /etc/os-release; echo "$VERSION_ID"): no free fix (LTS ended). Upgrade the OS, use packages.sury.org, or paid ELTS." ;;
   esac
   if ls -d /opt/alt/php[0-9]* >/dev/null 2>&1; then
@@ -602,14 +613,14 @@ update_hints() {
     info "  LiteSpeed lsphp: update the lsphpXY packages, then: /usr/local/lsws/bin/lswsctrl restart"
   fi
   if ls /etc/yum.repos.d/remi*.repo >/dev/null 2>&1 || [ -d /opt/remi ]; then
-    info "  Remi: ${pm:-dnf} upgrade 'php*' (module stream) or 'php8[0-9]-*' (SCL /opt/remi). Remi builds can lag:"
-    info "    if no fixed build is offered yet, keep this mitigation and the edge rules (--waf-print) until it is."
+    info "  Remi: ${pm:-dnf} upgrade 'php*' (module stream) or 'php8[0-9]-*' (SCL /opt/remi). 8.2.35 / 8.3.36 / 8.4.27 / 8.5.12"
+    info "    are on rpms.remirepo.net since 21 Oct. Some mirrors lag: ${pm:-dnf} clean metadata, then upgrade again."
   fi
   if [ "$pm" = apt ]; then
     if grep -rqs 'packages.sury.org' /etc/apt/sources.list /etc/apt/sources.list.d; then
-      info "  packages.sury.org repository detected (gets fixes first for Debian / Ubuntu)."
+      info "  packages.sury.org repository detected (gets fixes first for Debian / Ubuntu; arm64 builds came later than amd64)."
     elif grep -rqs 'ondrej/php' /etc/apt/sources.list /etc/apt/sources.list.d; then
-      info "  ppa:ondrej/php (Launchpad) can lag behind packages.sury.org. If apt offers no fixed build yet,"
+      info "  ppa:ondrej/php (Launchpad) can lag behind packages.sury.org (arm64: 8.4 / 8.5 later). If apt offers no fixed build yet,"
       info "    switching to https://packages.sury.org/php/ gets it sooner."
     fi
     info "  Distro / sury packages: apt-get update && apt-get install --only-upgrade \$(dpkg-query -W -f='\${binary:Package}\n' '*php*')"
