@@ -1,8 +1,10 @@
 # php-fix
 
+[![CI](https://github.com/ersinkoc/php-fix/actions/workflows/ci.yml/badge.svg)](https://github.com/ersinkoc/php-fix/actions/workflows/ci.yml)
+
 One-line emergency mitigation for **php2shell** (**CVE-2026-109618** / **CVE-2026-109619**), the critical PHP RCE bugs (CVSS v4.0 9.2) announced for the out-of-band PHP release on **21 October 2026, 14:00 UTC**.
 
-It sets `session.upload_progress.enabled = Off` across every PHP installation on a Linux server: distro packages, control panels, multiple PHP versions, PHP-FPM pools and Apache mod_php. Then it verifies the result through both the CLI and FPM binaries.
+It sets `session.upload_progress.enabled = Off` across every PHP installation on a Linux server: distro packages, control panels, multiple PHP versions, PHP-FPM pools and Apache mod_php. Then it verifies the result through both the CLI and FPM binaries. Read-only modes check patch status (`--check`), sweep for signs of compromise (`--audit`) and print WAF rules for the second attack path (`--waf-print`).
 
 > [!IMPORTANT]
 > **This is a stopgap, not a fix.** The PHP team's position is that *the only real mitigation is patching / upgrading PHP*.
@@ -17,53 +19,101 @@ curl -fsSL https://raw.githubusercontent.com/ersinkoc/php-fix/main/install.sh | 
 
 ### Verified install (recommended for production / fleets)
 
-Pin to a release tag and check the SHA-256 checksum before anything runs as root:
+Piping `main` into `sudo bash` means trusting whatever is on `main` at that moment. For production, use a release instead. Every release is built by GitHub Actions and ships with a `SHA256SUMS` file and a signed [build provenance attestation](https://docs.github.com/actions/security-for-github-actions/using-artifact-attestations):
 
 ```bash
-curl -fsSLO https://raw.githubusercontent.com/ersinkoc/php-fix/v1.1.0/install.sh
-echo "1f82cd74763a3dd8815e2cd574d8a9b98d522b0aafa7e94b380ddbf9e79848cf  install.sh" | sha256sum -c - && sudo bash install.sh
+V=v1.2.0
+curl -fsSLO https://github.com/ersinkoc/php-fix/releases/download/$V/install.sh
+curl -fsSLO https://github.com/ersinkoc/php-fix/releases/download/$V/SHA256SUMS
+sha256sum -c SHA256SUMS                                      # integrity
+gh attestation verify install.sh --repo ersinkoc/php-fix     # built from this repo by CI (optional, needs gh)
+sudo bash install.sh
 ```
 
-The checksum is also attached as `SHA256SUMS` to each [GitHub release](https://github.com/ersinkoc/php-fix/releases). Piping `main` into `sudo bash` means trusting whatever is on `main` at that moment.
+## Modes
 
-### Options
+| Command | Changes the server? | What it does |
+|---|---|---|
+| `sudo bash install.sh` | **Yes** (with backups) | Applies the mitigation, reloads services gracefully, verifies |
+| `... --dry-run` | No | Shows what the default mode would change |
+| `... --no-restart` | Yes, without reloads | Applies the changes but doesn't reload services; reload them yourself later |
+| `... --check` | No | Per binary: **PATCHED** / **UNPATCHED** / **EOL, no patch** / unknown. Also detects distro backports via the package changelog |
+| `... --audit[=HOURS]` | No | Heuristic indicator-of-compromise sweep (default: last 48 h). Runs at lowest CPU/IO priority |
+| `... --waf-print` | No | Prints ModSecurity / nginx / Apache / Cloudflare rules for the multipart path |
+| `... --revert[=STAMP]` | **Yes** | Restores the backups of the last run (or of the run `STAMP`, e.g. `20261021-120000`) and removes the mod_php drop-in |
 
-```bash
-curl -fsSL .../install.sh | sudo bash -s -- --dry-run      # show what would change, change nothing
-curl -fsSL .../install.sh | sudo bash -s -- --no-restart   # don't reload PHP / web services
-```
+With curl, pass options like this: `curl -fsSL .../install.sh | sudo bash -s -- --check`
 
 ### Exit codes
 
 | Code | Meaning |
 |---|---|
-| `0` | Mitigation applied and verified (EOL warnings may still be printed) |
-| `1` | Something failed or the setting is still On somewhere |
+| `0` | Success. `--check`: everything patched. `--audit`: nothing flagged |
+| `1` | A step failed, or the setting is still On somewhere. `--check`: something is unpatched or its status is unknown |
 | `2` | A PHP **older than 5.4** was found. This mitigation **cannot** protect it |
+| `3` | `--audit` found items to review |
 
-## What it does
+## Safety: designed not to break servers
+
+- **Backups:** every file is backed up as `<file>.bak-YYYYMMDD-HHMMSS` before it changes, and `--revert` puts the originals back byte-for-byte. Revert is tested in CI.
+- **Graceful reloads:** services get `systemctl reload-or-restart`. PHP-FPM and Apache reload gracefully, so in-flight requests finish, and LiteSpeed uses its own graceful restart. Worker processes are never killed directly.
+- **Apache config is always tested:** Apache is never reloaded with a failing config.
+  - If the config already fails before the script runs, Apache isn't touched at all.
+  - If the new drop-in makes the test fail, the drop-in is removed again.
+- **Read-only modes really are read-only:** `--dry-run`, `--check`, `--audit` and `--waf-print` change nothing. `--audit` runs under `nice -n 19` and `ionice -c3`, and caps log reads at 200k lines per file.
+- **No writes through symlinks** and no writes in directories that aren't root-owned or that are group/world-writable. This blocks symlink-planting attacks against the root process.
+- **Idempotent:** running the script again skips everything that's already fixed.
+- **Nothing your apps rely on breaks:** normal file uploads keep working. See [Side effects](#side-effects).
+
+## What the default mode does
 
 1. **Finds every `php.ini`** under the usual locations (`/etc`, `/usr/local/etc`, `/usr/local/lib`, `/usr/local/php*`, `/opt/cpanel`, `/opt/alt`, `/opt/plesk/php`, `/opt/remi`, `/etc/opt/remi`, `/www/server/php`, `/usr/local/lsws`), plus the one `php --ini` reports.
 2. **Sets `session.upload_progress.enabled = Off`** in each one. It replaces an existing (commented or active) line, adds the setting under `[Session]`, or appends a `[Session]` block.
 3. **Fixes overrides** in additional `.ini` files (`conf.d/*.ini`) that turn the setting back on.
 4. **Hardens PHP-FPM pools.** Any `php_value` / `php_flag` for this directive becomes `php_admin_flag[session.upload_progress.enabled] = off`, so neither the app nor a `.user.ini` can re-enable it.
-5. **Hardens Apache mod_php.** If mod_php is loaded, it drops in `zz-php2shell.conf` with `php_admin_flag session.upload_progress.enabled off`, which `.htaccess` cannot override. It runs `apachectl -t` first and rolls the file back if the config test fails.
+5. **Hardens Apache mod_php.** If mod_php is loaded, it drops in `zz-php2shell.conf` with `php_admin_flag session.upload_progress.enabled off`, which `.htaccess` cannot override.
    - Debian / Ubuntu: `/etc/apache2/conf-available/` + `a2enconf`
    - RHEL family: `/etc/httpd/conf.d/`
    - cPanel EA4: `/etc/apache2/conf.d/`
-6. **Reloads services**: `php*-fpm`, `ea-php*`, `plesk-php*`, `apache2` / `httpd`, LiteSpeed, and restarts `lsphp` workers.
+6. **Reloads services gracefully**: `php*-fpm`, `ea-php*`, `plesk-php*`, `apache2` / `httpd`, LiteSpeed.
 7. **Verifies** with every PHP **CLI** binary (`ini_get`) and every **php-fpm** binary (`php-fpm -i`). Each loads its own `php.ini`, so an FPM that still reads a different, unpatched ini is caught.
 8. **Checks the PHP version** of every binary it finds:
-   - **PHP < 5.4**: `session.upload_progress.enabled` doesn't exist there. Adding it does nothing, but the multipart parser is still exposed. The script reports *NOT PROTECTED* and exits `2`.
-   - **PHP < 8.2 (EOL branches)**: these will most likely get no official patch. The script warns you to block or limit multipart POSTs at the proxy/WAF and plan an upgrade.
+   - **PHP < 5.4**: the setting doesn't exist there, but the multipart parser is still exposed. The script reports *NOT PROTECTED* and exits `2`.
+   - **PHP < 8.2 (EOL branches)**: these will most likely get no official patch. The script warns you to block or limit multipart POSTs at the proxy/WAF (`--waf-print`) and plan an upgrade.
 
-Every modified file is backed up next to the original as `<file>.bak-YYYYMMDD-HHMMSS`. The script refuses to write in directories that aren't root-owned or that are group/world-writable, to prevent symlink planting. It is idempotent: running it again skips everything that's already fixed.
+## `--audit`: what it looks at
 
-### Tested
+This is a heuristic sweep, not proof either way. Every finding needs a human to look at it.
 
-- Debian 13 (trixie) with PHP 8.4, `php-fpm` and `libapache2-mod-php`. The script fixed the php.ini files, a `conf.d` override and an FPM pool override, and passed `apachectl -t`. A second run changed nothing.
-- **mod_php + `.htaccess` bypass:** with `php_flag session.upload_progress.enabled on` in `.htaccess`, a request returned `'1'` before the script ran and `'0'` after.
-- The `< 5.4` (exit `2`) and EOL warning paths were tested with stub binaries. Symlink planting in world-writable directories is refused.
+- PHP / `.htaccess` / `.user.ini` files changed in web roots within the window (listed for review; CMS updates are normal noise)
+- Webshell-like code in those files (`eval(base64_decode(...))`, `system($_POST...)`, and similar)
+- `.htaccess` / `.user.ini` files that turn upload progress back on
+- Shells or interpreters (`sh`, `bash`, `nc`, `python`, `perl`, `curl`, `wget`, …) whose parent is PHP or the web server. Some are legitimate, e.g. `mail()` calling `sh -c sendmail`.
+- Session files containing `upload_progress_` data, meaning the vulnerable code path was exercised
+- Recently changed cron jobs
+- Busiest POST-to-`.php` clients in the current access logs (context only)
+- Running PHP Docker containers, which this script cannot reach
+
+## Tested
+
+CI runs [`tests/run.sh`](tests/run.sh) on every push. It installs real PHP from the distro packages and exercises every mode end to end:
+
+| Distro | PHP | Notes |
+|---|---|---|
+| Debian 13 (trixie) | 8.4 | php-fpm + Apache mod_php |
+| Debian 12 (bookworm) | 8.2 | php-fpm + Apache mod_php |
+| Ubuntu 24.04 | 8.3 | php-fpm + Apache mod_php |
+| AlmaLinux 9 | 8.0 (EOL) | php-fpm + httpd |
+
+The tests cover:
+- dry-run changes nothing; php.ini, `conf.d` and FPM pool overrides are fixed; a second run is idempotent
+- **`.htaccess` with `php_flag … on` cannot re-enable the setting under mod_php** (a real HTTP request returns `'0'`)
+- `--check`, and `--audit` catching a planted webshell
+- the EOL warning and the `< 5.4` exit `2` path
+- `--revert` restores php.ini byte-for-byte and leaves Apache valid
+- world-writable directories are refused
+
+Run the tests locally with: `docker run --rm -v "$PWD:/src:ro" debian:trixie bash /src/tests/run.sh`
 
 ### Supported environments
 
@@ -78,7 +128,7 @@ Every modified file is backed up next to the original as `<file>.bak-YYYYMMDD-HH
 | DirectAdmin / custom builds | `/usr/local/php*`, `/usr/local/lib/php.ini` |
 | LiteSpeed / OpenLiteSpeed | `/usr/local/lsws/lsphp*/etc/php/*/litespeed/php.ini` |
 
-Requirements: bash 4+ (CentOS 7's bash 4.2 works), GNU coreutils / `sed` / `find` / `grep`, root.
+Requirements: bash 4+ (CentOS 7's bash 4.2 works), GNU coreutils / `sed` / `find` / `grep`, root (only `--check`, `--audit` and `--waf-print` work without root; `--audit` is less complete then).
 
 ## Side effects
 
@@ -95,49 +145,27 @@ For the real web SAPI, including FPM pool settings, put `<?php var_export(ini_ge
 
 ## Not covered (check these yourself)
 
-- **The second bug path (multipart parser).** For defense in depth until you patch, block or tightly limit `multipart/form-data` POSTs at your WAF / reverse proxy on endpoints that don't need uploads. With ModSecurity, a narrow rule for the upload-progress field:
-  ```
-  SecRule ARGS_NAMES "@streq PHP_SESSION_UPLOAD_PROGRESS" \
-    "id:1026109,phase:2,deny,status:403,log,msg:'php2shell upload_progress probe'"
-  ```
-  The field name comes from `session.upload_progress.name` (default `PHP_SESSION_UPLOAD_PROGRESS`). Adjust the rule if you changed it. For an Apache-level multipart block, see [syhunt/php2shell-protection](https://github.com/syhunt/php2shell-protection).
-- **`.user.ini` with PHP-CGI / LiteSpeed (non-FPM).** `session.upload_progress.enabled` is `PHP_INI_PERDIR`, so a site can turn it back on. Search for it:
-  ```bash
-  grep -rEil 'session\.upload_progress\.enabled' /var/www /home --include=.htaccess --include=.user.ini 2>/dev/null
-  ```
-  `.user.ini` changes take up to `user_ini.cache_ttl` (default 300 s) to apply.
-- **Docker images.** Configure them in the image instead, e.g. add `RUN echo 'session.upload_progress.enabled=Off' > /usr/local/etc/php/conf.d/zz-php2shell.ini` and rebuild.
+- **The second bug path (multipart parser).** For defense in depth until you patch, run `--waf-print` and apply the rules that fit your setup. The narrow ModSecurity rule (blocks only the upload-progress field) is safe for almost every site. The broad "multipart only on allowlisted paths" rules need your real upload URLs first. Also see [syhunt/php2shell-protection](https://github.com/syhunt/php2shell-protection).
+- **`.user.ini` with PHP-CGI / LiteSpeed (non-FPM).** The setting is `PHP_INI_PERDIR`, so a site can turn it back on. `--audit` reports these files.
+- **Docker images.** Configure them in the image instead, e.g. add `RUN echo 'session.upload_progress.enabled=Off' > /usr/local/etc/php/conf.d/zz-php2shell.ini` and rebuild. `--audit` lists running PHP containers.
 - **Windows / IIS.** Not supported.
 
 ## Rollback
 
-Each change has a timestamped backup. To restore one:
-
 ```bash
-cp -p /etc/php/8.3/fpm/php.ini.bak-20261021-120000 /etc/php/8.3/fpm/php.ini
-systemctl reload php8.3-fpm
+curl -fsSL https://raw.githubusercontent.com/ersinkoc/php-fix/main/install.sh | sudo bash -s -- --revert
 ```
 
-To remove the mod_php drop-in, delete `zz-php2shell.conf` (Debian/Ubuntu: `a2disconf zz-php2shell`) and reload Apache.
-
-List every backup this script created:
-
-```bash
-find / -xdev -name '*.bak-2026*' \( -name 'php.ini*' -o -name '*.ini.bak-*' -o -name '*.conf.bak-*' \) 2>/dev/null
-```
+This restores every file from the most recent run's backups, removes the mod_php drop-in and reloads services gracefully. Backup files are kept. Pass `--revert=20261021-120000` to restore a specific run, or add `--dry-run` to preview the revert first.
 
 ## After patching
 
-Once you're on the fixed PHP release, you can turn upload progress back on if your applications need it. If they don't, leaving it off reduces attack surface.
+Run `--check` to confirm every PHP binary is on a fixed build. Once you're on the fixed PHP release, you can turn upload progress back on if your applications need it. If they don't, leaving it off reduces attack surface.
 
 ## Roadmap
 
-These depend on the official fixed-version list (after 14:00 UTC):
-
-- `--check`: per-binary report: patched / unpatched / EOL with no patch
-- `--waf=print`: ready-to-paste ModSecurity / nginx / Apache snippets
-- `--audit`: quick IoC sweep (recently changed `.php` in webroots, shells spawned by php-fpm / apache, multipart POST bursts in access logs, `upload_progress_` keys in session files)
-- `--json`, `--revert`, plus CI with shellcheck and a distro test matrix
+- Fill in the official fixed versions for `--check` as soon as the advisory is out
+- `--json` output for fleet tooling (Ansible / Salt)
 
 ## References
 
