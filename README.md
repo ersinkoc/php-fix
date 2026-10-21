@@ -32,7 +32,7 @@ curl -fsSL https://raw.githubusercontent.com/ersinkoc/php-fix/main/install.sh | 
 Piping `main` into `sudo bash` means trusting whatever is on `main` at that moment. For production, use a release instead. Every release is built by GitHub Actions and ships with a `SHA256SUMS` file and a signed [build provenance attestation](https://docs.github.com/actions/security-for-github-actions/using-artifact-attestations):
 
 ```bash
-V=v1.5.0
+V=v1.6.0
 curl -fsSLO https://github.com/ersinkoc/php-fix/releases/download/$V/install.sh
 curl -fsSLO https://github.com/ersinkoc/php-fix/releases/download/$V/SHA256SUMS
 sha256sum -c SHA256SUMS                                      # integrity
@@ -47,7 +47,7 @@ sudo bash install.sh
 | `sudo bash install.sh` | **Yes** (with backups) | Applies the mitigation, reloads services gracefully, verifies |
 | `... --dry-run` | No | Shows what the default mode would change |
 | `... --no-restart` | Yes, without reloads | Applies the changes but doesn't reload services; reload them yourself later |
-| `... --check` | No | **PATCHED** / **UNPATCHED** / **EOL, no patch** / unknown against 8.2.35 / 8.3.36 / 8.4.27 / 8.5.12 for every PHP binary, **every running FPM pool (live)** and **every running Docker container** (`docker exec php`). Also detects distro backports via the package changelog, and warns about held / version-locked PHP packages (`apt-mark hold`, `dnf versionlock`) that would silently skip the update |
+| `... --check` | No | **PATCHED** / **UNPATCHED** / **EOL, no patch** / unknown against 8.2.35 / 8.3.36 / 8.4.27 / 8.5.12 for every PHP binary, **every running FPM pool (live)** and **every running Docker container** (`docker exec php`). Also detects distro backports via the package changelog, and warns about held / version-locked PHP packages (`apt-mark hold`, `dnf versionlock`) that would silently skip the update. **After updating:** flags workers still running the old (replaced) PHP, and prints the update + restart commands for each PHP source it finds (Plesk, cPanel, DirectAdmin, CloudLinux, Remi, sury / ondrej, LiteSpeed, Docker) |
 | `... --audit[=HOURS]` | No | Heuristic indicator-of-compromise sweep (default: last 48 h). Runs at lowest CPU/IO priority |
 | `... --waf-print` | No | Prints rules for the multipart path: ModSecurity, nginx, Apache, LiteSpeed/.htaccess, Caddy/FrankenPHP, HAProxy, Cloudflare |
 | `... --revert[=STAMP]` | **Yes** | Restores the backups of the last run (or of the run `STAMP`, e.g. `20261021-120000`) and removes the mod_php drop-in |
@@ -158,7 +158,8 @@ The tests cover:
 - **`--probe`:** reports `0` (blocked) against Apache with the rule, and `1` (reaches PHP) without it
 - **`--user-ini`:** writes `.user.ini` as the site user, is idempotent, and is refused as root
 - **PHP 8.5 (stub binary):** `--check` flags `fatal_error_backtraces` On; the fix writes the `conf.d` drop-in only on unpatched 8.5, verifies it, is idempotent, and `--revert` removes it
-- **Fixed versions:** `--check` classifies real distro PHP as PATCHED / UNPATCHED / EOL (Debian trixie already ships 8.4.27)
+- **Fixed versions:** `--check` classifies real distro PHP as PATCHED / UNPATCHED / EOL (Debian trixie ships 8.4.27; Ubuntu 24.04's backported 8.3.6 is detected from its changelog)
+- **After an update:** `--check` reports FPM workers still running a replaced binary, prints update and restart hints, and stops reporting once FPM is restarted. It warns about `memory_limit = -1` left on a patched FPM, but not on CLI, where `-1` is the default
 - **`--audit` and `--check`:**
   - `--audit` flags a planted webshell, a worker `SIGSEGV` log line, a PHP file in `/tmp`, a reverse-shell command line, and a multipart request answered with `502` in a `Content-Type`-logging access log
   - `--audit` output stays clean when file names carry terminal escapes (ESC, 8-bit and UTF-8 C1)
@@ -220,17 +221,58 @@ It compares a multipart POST, a multipart PUT and a mixed-case `Content-Type` ag
 
 ## Updating PHP
 
-`--check` prints the right command for your system. Typical commands:
+Control panels and several repositories ship **their own PHP builds**. `apt upgrade` / `dnf upgrade` doesn't touch Plesk's, cPanel's, DirectAdmin's or CloudLinux's PHP. One server can have several of these side by side. `--check` lists every PHP it finds, detects where each one comes from, and prints the update command for that source.
+
+### Where the fixed builds are (as of 21 October 2026, ~15:00 UTC)
+
+This changes hour by hour. Check the vendor's page, then confirm with `--check`.
+
+| Source | Where it lives | Status | Update |
+|---|---|---|---|
+| **php.net** upstream | — | ✅ 8.2.35, 8.3.36, 8.4.27, 8.5.12 | — |
+| **Plesk** (Linux) | `/opt/plesk/php/X.Y` | ✅ all four branches. Windows: in progress | Tools & Settings → Updates, or `plesk installer update` |
+| **cPanel EA4** | `/opt/cpanel/ea-phpXY` | ⏳ not confirmed yet (last release: EA4 25.86, pre-fix) | `dnf upgrade 'ea-php*'` (`yum` on EL7, `apt` on Ubuntu), or `/scripts/upcp` |
+| **DirectAdmin CustomBuild** | `/usr/local/php*` (compiled) | ⏳ staff: "as soon as PHP publishes". Distro patches don't apply | `da build update && da build php` |
+| **CloudLinux alt-php** | `/opt/alt/phpXY` | ⏳ in progress ([status](https://cloudlinux.statuspage.io/)). Imunify360 rules 8.83 add a block rule | `dnf upgrade 'alt-php*'` |
+| **packages.sury.org** (Debian 12/13, Ubuntu 22.04/24.04) | `/etc/php/X.Y` | ✅ 8.2–8.5, amd64 and arm64 | `apt-get install --only-upgrade 'php8.3*'` |
+| **ppa:ondrej/php** (Launchpad) | `/etc/php/X.Y` | ⏳ lags behind sury.org | wait, or switch to packages.sury.org |
+| **Ubuntu** own packages | `/etc/php/X.Y` | ✅ 22.04 `8.1.2-1ubuntu2.28`, 24.04 `8.3.6-0ubuntu0.24.04.13`, 26.04 `8.5.4-0ubuntu1.5`. 20.04: Ubuntu Pro only | `apt upgrade` |
+| **Debian** own packages | `/etc/php/X.Y` | ✅ 13 `8.4.27-1~deb13u1`. ⏳ 12 `8.2.35-1~deb12u1`. 11: no free fix | `apt upgrade` |
+| **RHEL / Alma / Rocky** AppStream | `/etc/php.ini` | ⏳ watch your vendor's errata | `dnf upgrade 'php*'`, `dnf updateinfo list --security` |
+| **Remi** | `/etc/opt/remi`, `/opt/remi` | ❌ not on 21 Oct. PHP advises distro packages or a source build | `dnf upgrade 'php*'` once it's there |
+| **Docker `php` image** | inside the image | ⏳ not yet | `docker build --pull`, then `docker compose up -d --force-recreate` |
+| Gentoo / Arch / windows.php.net | — | ✅ (Arch: 8.3, 8.5) | package manager / download |
+
+**Backports keep the old version number.** Ubuntu's `8.3.6-0ubuntu0.24.04.13` is fixed even though it says 8.3.6. `--check` reads the package changelog for the CVE ids and reports these as PATCHED. Debian and sury changelogs may not list the CVEs, but their upstream numbers (8.2.35, 8.4.27 and so on) are new enough.
+
+### Commands
 
 ```bash
-# Debian / Ubuntu (distro packages or the ondrej/sury repositories)
+# Debian / Ubuntu (distro packages or packages.sury.org)
 apt-get update && apt-get install --only-upgrade $(dpkg-query -W -f='${binary:Package}\n' '*php*')
-# RHEL / Alma / Rocky / Fedora / Remi / cPanel EA4
-dnf upgrade '*php*'        # or: yum update '*php*'
-# Docker: rebuild on the fixed official tag, e.g. php:8.4.27-fpm, php:8.3.36-apache
+# RHEL family / Remi / cPanel EA4 / CloudLinux alt-php
+dnf upgrade 'php*' 'ea-php*' 'alt-php*'        # yum on EL7
+# Plesk
+plesk installer update
+# DirectAdmin
+da build update && da build php
 ```
 
-Then **restart every PHP worker**: PHP-FPM, Apache with mod_php, LiteSpeed lsphp. Old workers keep running the old code until they're replaced. Control panels (Plesk, CloudLinux alt-php, DirectAdmin CustomBuild) update PHP from their own updaters. Run `--check` afterwards.
+### Restart, or the update doesn't count
+
+Running workers keep the old PHP in memory until they're replaced.
+
+| How PHP runs | After the update |
+|---|---|
+| PHP-FPM | `systemctl restart php8.3-fpm` (RHEL: `php-fpm`; Plesk: `plesk-php83-fpm`; cPanel: `ea-php83-php-fpm`) |
+| Apache mod_php | **Full** `systemctl restart apache2` / `httpd`. A graceful reload keeps the old `libphp` loaded |
+| LiteSpeed | `/usr/local/lsws/bin/lswsctrl restart` |
+| Docker | Recreate the container from the new image. A restart keeps the old image |
+| Queue workers, Octane, Swoole, RoadRunner, cron daemons | Restart them (`php artisan queue:restart`; Octane needs a process restart) |
+
+`--check` finds PHP, Apache and LiteSpeed processes that still map **replaced (deleted) PHP files** and reports them as not patched, with the process names to restart. Manual equivalent: `grep -lE ' /[^ ]*php[^ ]* \(deleted\)$' /proc/[0-9]*/maps`.
+
+If you set `memory_limit = -1` as an interim measure, set a real limit again after patching. The patched build has a hard OOM limit, and processes that hit it exit with code 137. `--check` warns about FPM builds that are still at `-1`.
 
 ## Blocking multipart before PHP (CVE-2026-109618)
 
@@ -325,6 +367,11 @@ Timeline note: the fix and advisories are public, so the patch diff now shows at
 - [GHSA-6wmf-4rv5-p3rp / CVE-2026-109619: RCE via stale global state](https://github.com/php/php-src/security/advisories/GHSA-6wmf-4rv5-p3rp)
 - [Help Net Security: PHP2Shell patched](https://www.helpnetsecurity.com/2026/10/21/php2shell-php-vulnerabilities-patched-cve-2026-109618-cve-2026-109619/)
 - [Tenable FAQ](https://www.tenable.com/blog/php2shell-cve-2026-109618-cve-2026-109619-frequently-asked-questions-about-critical-php-remote)
+- [Plesk advisory](https://support.plesk.com/hc/en-us/articles/44397729587351-Vulnerability-CVE-2026-109618-and-CVE-2026-109619-Remote-code-execution-in-PHP-shipped-with-Plesk)
+- [Ubuntu: php2shell fixes available](https://ubuntu.com/blog/php2shell-vulnerability-fixes-available)
+- [ma.ttias.be: per-repository patch status and restart guide](https://ma.ttias.be/php-cve-2026-109618-patch/)
+- [DirectAdmin forum: Critical PHP updates](https://forum.directadmin.com/threads/critical-php-updates.82726/)
+- [CloudLinux status](https://cloudlinux.statuspage.io/)
 - [PHP-UP-2026: pre-release write-up (heap UAF in session upload progress)](https://jackalsyn.com/posts/php-up-2026.html)
 - [php2shell overview: SecureLayer7](https://blog.securelayer7.net/php-rce-cve-2026-109618-109619/)
 - [Disabling session.upload_progress before the php2shell patch lands](https://lilting.ch/en/articles/php2shell-session-upload-progress-uaf)

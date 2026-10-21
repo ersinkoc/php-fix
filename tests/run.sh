@@ -10,8 +10,11 @@ pass() { echo "PASS: $*"; PASS=$((PASS+1)); }
 fail() { echo "FAIL: $*"; FAIL=$((FAIL+1)); }
 same() { [ "$(sha256sum < "$1")" = "$(sha256sum < "$2")" ]; }
 # apachectl start/stop return before the server is really up/down: wait on the port
-a_start() { apache2ctl start >/dev/null 2>&1; for _ in $(seq 50); do curl -s -o /dev/null localhost/ && return; sleep 0.2; done; }
-a_stop()  { apache2ctl stop >/dev/null 2>&1; for _ in $(seq 50); do curl -s -o /dev/null localhost/ || return; sleep 0.2; done; }
+# start / stop and wait until Apache really answers / the old master is really gone (pid file removed)
+a_start() { for _ in 1 2 3; do apache2ctl start >/dev/null 2>&1
+  for _ in $(seq 50); do curl -s -o /dev/null localhost/ && return; sleep 0.2; done; done; }
+a_stop()  { apache2ctl stop >/dev/null 2>&1
+  for _ in $(seq 100); do [ -e /var/run/apache2/apache2.pid ] || curl -s -o /dev/null localhost/ || return; sleep 0.2; done; }
 expect_rc() { local want="$1" got="$2" what="$3"; [ "$got" = "$want" ] && pass "$what (rc=$got)" || fail "$what (rc=$got, want $want)"; }
 
 echo "== Installing PHP"
@@ -156,6 +159,16 @@ NGX
   bash $S --check --json | php -r '$j = json_decode(stream_get_contents(STDIN), true); exit(is_array($j) && isset($j["results"][0]["status"]) ? 0 : 1);' \
     && pass "--check --json is valid JSON" || fail "--check --json invalid"
   rm -f "$POOL3"
+
+  echo "== --check after a package update"
+  # Simulate an update: the binary is replaced on disk while the old master keeps running
+  cp -p "$FPMBIN" /root/fpm.new && rm -f "$FPMBIN" && cp -p /root/fpm.new "$FPMBIN"
+  out="$(bash $S --check 2>&1)"
+  echo "$out" | grep -q 'Still running replaced (old) PHP code, restart these: php-fpm' && pass "--check catches workers still running the old PHP" || fail "stale workers not reported"
+  echo "$out" | grep -q 'restart every PHP worker' && pass "--check prints update / restart hints" || fail "no update hints"
+  pkill -f php-fpm; sleep 1; "$FPMBIN" -D; sleep 1
+  bash $S --check 2>&1 | grep -q 'Still running replaced' && fail "stale reported after restart" || pass "no stale report after restart"
+  rm -f /root/fpm.new
   nginx -s stop; pkill -f php-fpm; sleep 1
   rm -f /var/www/html/.user.ini /etc/nginx/conf.d/php2shell.conf
 fi
@@ -209,6 +222,15 @@ printf '#!/bin/sh\ncase "$2" in *PHP_VERSION*) echo 5.3.29;; *) echo;; esac\n' >
 bash $S --no-restart >/dev/null; expect_rc 2 $? "PHP < 5.4 exits 2"
 rm -f /usr/bin/php74 /usr/bin/php53
 
+echo "== --check update hints per PHP source (fake panel dirs)"
+mkdir -p /usr/local/psa /opt/cpanel/ea-php83 /usr/local/directadmin /opt/alt/php83
+printf '#!/bin/sh\ncase "$2" in *PHP_VERSION*) echo 7.4.33;; *) echo;; esac\n' > /usr/bin/php74; chmod +x /usr/bin/php74   # something unpatched
+out="$(bash $S --check 2>&1)"; rm -f /usr/bin/php74
+for w in 'Plesk PHP' 'cPanel EA4 PHP' 'DirectAdmin CustomBuild' 'CloudLinux alt-php'; do
+  echo "$out" | grep -q "$w" && pass "hint: $w" || fail "no hint: $w"
+done
+rmdir /usr/local/psa /opt/cpanel/ea-php83 /opt/cpanel /usr/local/directadmin /opt/alt/php83 /opt/alt 2>/dev/null
+
 echo "== --check knows the fixed versions"
 out="$(bash $S --check 2>&1)"
 echo "$out" | grep -Eq '(PATCHED|EOL), mitigation' && ! echo "$out" | grep -q 'fixed versions not known' && pass "--check classifies against the fixed versions" || fail "--check still unknown"
@@ -233,6 +255,12 @@ bash $S --no-restart | grep -q 'Wrote fatal_error_backtraces' && fail "8.5 drop-
 rm -f /etc/php85stub/conf.d/zz-php2shell.ini
 STUB_VER=8.5.12 bash $S --no-restart >/dev/null
 [ -f /etc/php85stub/conf.d/zz-php2shell.ini ] && fail "drop-in written on patched 8.5" || pass "patched 8.5 left alone"
+printf '#!/bin/sh\ncase "$1" in -v) echo "PHP 8.5.12 (fpm-fcgi)";; -i) printf "memory_limit => -1 => -1\\nsession.upload_progress.enabled => Off => Off\\n";; esac\n' > /usr/sbin/php-fpm85stub
+chmod +x /usr/sbin/php-fpm85stub
+out="$(bash $S --check 2>&1)"
+echo "$out" | grep -q 'php-fpm85stub .*memory_limit is -1' && pass "--check warns about leftover memory_limit = -1 (FPM)" || fail "no memory_limit -1 warning"
+echo "$out" | grep -q '/usr/bin/php[0-9.]* .*memory_limit is -1' && fail "memory_limit warning on CLI (-1 is the CLI default)" || pass "no memory_limit warning on CLI"
+rm -f /usr/sbin/php-fpm85stub
 bash $S --no-restart >/dev/null   # leave it in place for the --revert test
 bash $S --revert; expect_rc 0 $? "revert"
 same "$CLI_INI" /root/cli.ini.orig && pass "php.ini restored byte-for-byte" || fail "php.ini not restored"

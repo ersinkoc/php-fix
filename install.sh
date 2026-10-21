@@ -18,7 +18,7 @@
 
 set -u
 
-VERSION="1.5.0"
+VERSION="1.6.0"
 DIRECTIVE="session.upload_progress.enabled"
 TS="$(date +%Y%m%d-%H%M%S)"
 MODE=fix
@@ -476,6 +476,68 @@ classify() {
   fi
 }
 
+# Processes still running PHP code whose files were replaced by an update (needs a restart).
+# Prints "count name" lines. Read-only; as non-root only own processes are visible.
+stale_php() {
+  local p c
+  for p in /proc/[0-9]*; do
+    c="$(cat "$p/comm" 2>/dev/null)" || continue
+    case "$c" in php*|lsphp*|apache2|httpd|frankenphp|litespeed|lshttpd|openlitespeed) ;; *) continue ;; esac
+    grep -qE '/[^ ]*php[^ ]* \(deleted\)$' "$p/maps" 2>/dev/null && echo "$c"
+  done | sort | uniq -c | awk '{print $1, $2}'
+}
+
+# Where this host's PHP comes from, and the update command for each source
+update_hints() {
+  local pm=""
+  command -v apt-get >/dev/null 2>&1 && pm=apt
+  [ -z "$pm" ] && command -v dnf >/dev/null 2>&1 && pm=dnf
+  [ -z "$pm" ] && command -v yum >/dev/null 2>&1 && pm=yum
+  info "How to update PHP on this host:"
+  if [ -d /usr/local/psa ] || [ -d /opt/plesk/php ]; then
+    info "  Plesk PHP (/opt/plesk/php): Tools & Settings > Updates, or: plesk installer update"
+    info "    (Plesk for Windows builds may come later than Linux.)"
+  fi
+  if [ -d /usr/local/cpanel ] || ls -d /opt/cpanel/ea-php* >/dev/null 2>&1; then
+    case "$pm" in apt) info "  cPanel EA4 PHP: apt-get update && apt-get install --only-upgrade \$(dpkg-query -W -f='\${binary:Package}\n' 'ea-php*')" ;;
+                  *)   info "  cPanel EA4 PHP: ${pm:-dnf} upgrade 'ea-php*'   (or WHM > EasyApache 4; /scripts/upcp)" ;; esac
+    info "    Fixed only once cPanel has published the new ea-phpXY builds; --check above shows what is installed."
+  fi
+  if [ -d /usr/local/directadmin ]; then
+    info "  DirectAdmin CustomBuild compiles PHP itself (distro patches do not apply):"
+    info "    da build update && da build php   (older: cd /usr/local/directadmin/custombuild && ./build update && ./build php n)"
+  fi
+  if ls -d /opt/alt/php[0-9]* >/dev/null 2>&1; then
+    info "  CloudLinux alt-php: ${pm:-dnf} upgrade 'alt-php*'   (status: https://cloudlinux.statuspage.io/)"
+  fi
+  if [ -d /usr/local/lsws ]; then
+    info "  LiteSpeed lsphp: update the lsphpXY packages, then: /usr/local/lsws/bin/lswsctrl restart"
+  fi
+  if ls /etc/yum.repos.d/remi*.repo >/dev/null 2>&1 || [ -d /opt/remi ]; then
+    info "  Remi: ${pm:-dnf} upgrade 'php*' (module stream) or 'php8[0-9]-*' (SCL /opt/remi). Remi builds can lag:"
+    info "    if no fixed build is offered yet, keep this mitigation and the edge rules (--waf-print) until it is."
+  fi
+  if [ "$pm" = apt ]; then
+    if grep -rqs 'packages.sury.org' /etc/apt/sources.list /etc/apt/sources.list.d; then
+      info "  packages.sury.org repository detected (gets fixes first for Debian / Ubuntu)."
+    elif grep -rqs 'ondrej/php' /etc/apt/sources.list /etc/apt/sources.list.d; then
+      info "  ppa:ondrej/php (Launchpad) can lag behind packages.sury.org. If apt offers no fixed build yet,"
+      info "    switching to https://packages.sury.org/php/ gets it sooner."
+    fi
+    info "  Distro / sury packages: apt-get update && apt-get install --only-upgrade \$(dpkg-query -W -f='\${binary:Package}\n' '*php*')"
+  elif [ -n "$pm" ]; then
+    info "  Distro packages: $pm upgrade 'php*'   then: $pm updateinfo list --security | grep -i php"
+  elif command -v apk >/dev/null 2>&1; then
+    info "  Alpine: apk upgrade"
+  fi
+  if command -v docker >/dev/null 2>&1 && docker ps --format '{{.Image}}' 2>/dev/null | grep -qi php; then
+    info "  Docker: docker build --pull (or pull the fixed tag), then recreate: docker compose up -d --force-recreate"
+  fi
+  info "  Distro builds keep the old upstream number with the fix backported: --check reads the package changelog."
+  info "Then restart every PHP worker: FPM (systemctl restart php*-fpm), Apache with mod_php (full restart,"
+  info "  not a graceful reload), LiteSpeed, queue / Octane / long-running PHP workers. Run --check again."
+}
+
 JSON_ROWS=()
 json_str() { local x; x="$(clean "$1")"; x="${x//\\/\\\\}"; printf '"%s"' "${x//\"/\\\"}"; }
 # report <kind> <target> <version> <status> <mitigation> <note>
@@ -493,6 +555,9 @@ if [ "$MODE" = check ]; then
   UNPATCHED=0
   while IFS='|' read -r b sapi ver v; do
     classify "$ver" "$v" "$b"
+    if [ "$sapi" = fpm ] && [ "$STATUS" = PATCHED ] && [ "$(ini_val "$b" "$sapi" memory_limit)" = -1 ]; then
+      NOTE="$NOTE memory_limit is -1: the patched build has a hard OOM limit, set a real memory_limit again."
+    fi
     if [ "$(branch_num "$ver")" = 805 ] && [ "$STATUS" != PATCHED ]; then
       is_off "$(ini_val "$b" "$sapi" "$FEB")" && NOTE="$NOTE ${FEB} Off." || NOTE="$NOTE ${FEB} is On (confirmed RCE producer): run the fix."
     fi
@@ -531,23 +596,19 @@ if [ "$MODE" = check ]; then
     [ "$JSON" -eq 1 ] || err "Held / version-locked PHP packages will NOT be updated: $held"
   fi
 
-  if [ "$UNPATCHED" -ne 0 ] && [ "$JSON" -eq 0 ]; then
-    info "Update PHP from your vendor, then restart every PHP worker (FPM, Apache, LiteSpeed):"
-    if command -v apt-get >/dev/null 2>&1; then
-      info "  apt-get update && apt-get install --only-upgrade \$(dpkg-query -W -f='\${binary:Package}\n' '*php*')"
-    elif command -v dnf >/dev/null 2>&1; then info "  dnf upgrade '*php*'"
-    elif command -v yum >/dev/null 2>&1; then info "  yum update '*php*'"
-    elif command -v apk >/dev/null 2>&1; then info "  apk upgrade"
-    fi
-    info "  Control panels: update PHP from the panel (cPanel EA4, Plesk, CloudLinux alt-php, DirectAdmin CustomBuild)."
-    info "  Docker: pull the fixed php image tag and rebuild; restarting the old container is not enough."
-    info "  Distro builds keep the old upstream number: check your distro's security tracker for the fixed package revision."
+  # Updated on disk but the old code is still running: the update does not count until a restart
+  stale="$(stale_php | awk '{printf "%s%s (%s)", (NR>1?", ":""), $2, $1}')"
+  if [ -n "$stale" ]; then
+    UNPATCHED=1
+    [ "$JSON" -eq 1 ] || err "Still running replaced (old) PHP code, restart these: $stale"
   fi
 
+  [ "$UNPATCHED" -ne 0 ] && [ "$JSON" -eq 0 ] && update_hints
+
   if [ "$JSON" -eq 1 ]; then
-    printf '{"tool":"php-fix","version":%s,"host":%s,"time":%s,"patched_versions":%s,"held_packages":%s,"exit":%s,"results":[' \
+    printf '{"tool":"php-fix","version":%s,"host":%s,"time":%s,"patched_versions":%s,"held_packages":%s,"stale_processes":%s,"exit":%s,"results":[' \
       "$(json_str "$VERSION")" "$(json_str "$(hostname 2>/dev/null)")" "$(json_str "$(date -u +%Y-%m-%dT%H:%M:%SZ)")" \
-      "$(json_str "$PATCHED_VERSIONS")" "$(json_str "$held")" "$UNPATCHED"
+      "$(json_str "$PATCHED_VERSIONS")" "$(json_str "$held")" "$(json_str "$stale")" "$UNPATCHED"
     (IFS=,; printf '%s' "${JSON_ROWS[*]+"${JSON_ROWS[*]}"}")
     printf ']}\n'
   fi
@@ -980,5 +1041,5 @@ if [ "$LEGACY" -eq 1 ]; then
 fi
 echo -e "${G}DONE ✔ ${DIRECTIVE} = Off${N}"
 [ "$EOL" -eq 1 ] && err "EOL PHP versions found: they will likely get no patch. See the warnings above."
-echo "Next: run with --check after patching, and --audit to look for signs of compromise."
+echo "Next: update PHP (--check shows how for this host), restart every PHP worker, run --check again, then --audit."
 echo "Reminder: this is a stopgap. Upgrade PHP to ${PATCHED_VERSIONS// / / } (or your distro's fixed build) now."
