@@ -13,11 +13,11 @@ jobs:
   release:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Checksums
         run: sha256sum install.sh > SHA256SUMS && cat SHA256SUMS
       - name: Signed build provenance (verify with `gh attestation verify`)
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@v4
         with:
           subject-path: install.sh
       - name: Publish release assets
