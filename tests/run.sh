@@ -240,6 +240,26 @@ if grep -q '^ID=ubuntu' /etc/os-release; then
     && pass "--check reports an Ubuntu build older than the USN as unpatched" || fail "old Ubuntu build not reported"
 fi
 
+echo "== --check: DirectAdmin CustomBuild backport (same version number, extra patch)"
+DAP=/usr/local/directadmin/custombuild/patches/php-7.4
+mkdir -p /usr/local/php74/bin "$DAP"
+printf '#!/bin/sh\ncase "$2" in *PHP_VERSION*) echo 7.4.33;; *) echo;; esac\n' > /usr/local/php74/bin/php; chmod +x /usr/local/php74/bin/php
+touch -d '2026-10-21 12:00' "$DAP/143-php-7.4-cve-2026-109618.patch"; touch -d '2026-10-21 13:00' /usr/local/php74/bin/php
+bash $S --check 2>&1 | grep -q 'php74/bin/php (cli 7.4.33): PATCHED.*DirectAdmin CustomBuild backport' \
+  && pass "DA: binary built after the CVE patch is PATCHED" || fail "DA built binary not recognised"
+touch -d '2026-10-21 11:00' /usr/local/php74/bin/php
+bash $S --check 2>&1 | grep -q 'php74/bin/php (cli 7.4.33): UNPATCHED.*da build php' \
+  && pass "DA: binary older than the CVE patch says da build php" || fail "DA pending build not reported"
+rm -rf /usr/local/php74 /usr/local/directadmin
+
+echo "== --check: Imunify360 WAF ruleset version"
+IMV=/etc/apache2/conf.d/modsec_vendor_configs/imunify360-full-apache
+mkdir -p "$IMV" && echo 8.82 > "$IMV/VERSION"
+bash $S --check 2>&1 | grep -q 'Imunify360 WAF rules 8.82 are older than 8.83' && pass "Imunify360 < 8.83 flagged" || fail "Imunify360 old ruleset not flagged"
+echo 8.83 > "$IMV/VERSION"
+bash $S --check 2>&1 | grep -q 'Imunify360 WAF rules 8.83 (>= 8.83' && pass "Imunify360 8.83 recognised" || fail "Imunify360 8.83 not recognised"
+rm -rf /etc/apache2/conf.d/modsec_vendor_configs; rmdir /etc/apache2/conf.d /etc/apache2 2>/dev/null
+
 echo "== --check knows the fixed versions"
 out="$(bash $S --check 2>&1)"
 echo "$out" | grep -Eq '(PATCHED|EOL), mitigation' && ! echo "$out" | grep -q 'fixed versions not known' && pass "--check classifies against the fixed versions" || fail "--check still unknown"

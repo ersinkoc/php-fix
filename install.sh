@@ -18,7 +18,7 @@
 
 set -u
 
-VERSION="1.7.0"
+VERSION="1.8.0"
 DIRECTIVE="session.upload_progress.enabled"
 TS="$(date +%Y%m%d-%H%M%S)"
 MODE=fix
@@ -283,7 +283,7 @@ find_php_bins() {
 find_fpm_bins() {
   ls /usr/sbin/php-fpm* /usr/local/sbin/php-fpm /opt/cpanel/ea-php*/root/usr/sbin/php-fpm \
      /opt/remi/php*/root/usr/sbin/php-fpm /opt/alt/php*/usr/sbin/php-fpm /opt/plesk/php/*/sbin/php-fpm \
-     /www/server/php/*/sbin/php-fpm /usr/local/php*/sbin/php-fpm 2>/dev/null \
+     /www/server/php/*/sbin/php-fpm /usr/local/php*/sbin/php-fpm* 2>/dev/null \
   | while read -r b; do [ -x "$b" ] && readlink -f "$b"; done | sort -u
 }
 
@@ -362,6 +362,18 @@ ubuntu_build() {
     if dpkg --compare-versions "$inst" ge "$f"; then echo "fixed|$inst"; else echo "old|$inst|$f"; fi
     return 0
   done
+}
+
+# da_build <binary> <branch X.Y>: DirectAdmin CustomBuild backports the fix into EOL branches
+# (7.4, 8.0, 8.1) without changing the version number. Prints "built" when the binary is newer
+# than CustomBuild's CVE patch, "pending" when it is older; nothing when there is no such patch.
+DA_PATCHES=/usr/local/directadmin/custombuild/patches
+da_build() {
+  local b="$1" br="$2" pf
+  case "$b" in /usr/local/php*) ;; *) return 0 ;; esac
+  pf="$(ls -t "$DA_PATCHES/php-$br/"*[Cc][Vv][Ee]-2026-10961[89]*.patch 2>/dev/null | head -1)"
+  [ -n "$pf" ] || return 0
+  if [ "$b" -nt "$pf" ]; then echo built; else echo pending; fi
 }
 
 # ---------------------------------------------------------------------------
@@ -506,6 +518,9 @@ classify() {
       STATUS=UNPATCHED; NOTE="Ubuntu's fixed build is ${ub##*|} ($UBUNTU_USN): apt upgrade"
       [ "$n" -lt 801 ] && NOTE="$NOTE. Ubuntu 20.04 and older: Ubuntu Pro (ESM) only, sudo pro attach"
     fi
+  elif [ -n "$b" ] && ub="$(da_build "$b" "${ver%.*}")" && [ -n "$ub" ]; then
+    if [ "$ub" = built ]; then STATUS=PATCHED; NOTE="DirectAdmin CustomBuild backport (binary built after the CVE patch)"
+    else STATUS=UNPATCHED; NOTE="DirectAdmin CustomBuild has the CVE patch but this binary is older: da build php"; fi
   elif [ -n "$b" ] && backported "$b"; then STATUS=PATCHED; NOTE="distro backport (CVE in package changelog)"
   elif [ "$n" -lt 802 ]; then STATUS=EOL; NOTE="EOL upstream: no php.net patch. Your vendor may backport it (RHEL, Ubuntu Pro, Debian LTS, TuxCare, CloudLinux); otherwise upgrade PHP."
   elif [ -n "$fixed" ]; then STATUS=UNPATCHED; NOTE="fixed in $fixed"
@@ -542,8 +557,14 @@ update_hints() {
   fi
   if [ -d /usr/local/directadmin ]; then
     info "  DirectAdmin CustomBuild compiles PHP itself (distro patches do not apply):"
-    info "    da build update && da build php   (older: cd /usr/local/directadmin/custombuild && ./build update && ./build php n)"
+    info "    da update && da build php   (8.2-8.5 get the new versions; 7.4 / 8.0 / 8.1 get patches, shown with a * in CustomBuild)"
+    info "    DA updates itself, but PHP is only rebuilt by hand (or by the CustomBuild cron, if enabled)."
   fi
+  case "$(. /etc/os-release 2>/dev/null; echo "${ID:-}:${VERSION_CODENAME:-}")" in
+    debian:bookworm) info "  Debian 12: php8.2 8.2.35-1~deb12u1 (DLA-4848-1, via the security archive)" ;;
+    debian:trixie)   info "  Debian 13: php8.4 8.4.27-1~deb13u1 (DSA-6574-1)" ;;
+    debian:bullseye|debian:buster) info "  Debian $(. /etc/os-release; echo "$VERSION_ID"): no free fix (LTS ended). Upgrade the OS, use packages.sury.org, or paid ELTS." ;;
+  esac
   if ls -d /opt/alt/php[0-9]* >/dev/null 2>&1; then
     info "  CloudLinux alt-php: ${pm:-dnf} upgrade 'alt-php*'   (status: https://cloudlinux.statuspage.io/)"
   fi
@@ -640,6 +661,15 @@ if [ "$MODE" = check ]; then
     UNPATCHED=1
     [ "$JSON" -eq 1 ] || err "Held / version-locked PHP packages will NOT be updated: $held"
   fi
+
+  # Imunify360 (cPanel / CloudLinux / Plesk): ruleset 8.83 adds a php2shell block rule on Apache
+  for f in /etc/apache2/conf.d/modsec_vendor_configs/imunify360*/VERSION /etc/httpd/conf.d/modsec_vendor_configs/imunify360*/VERSION \
+           /usr/local/apache/conf/modsec_vendor_configs/imunify360*/VERSION; do
+    [ -f "$f" ] && [ "$JSON" -eq 0 ] || continue
+    iv="$(grep -oE '[0-9]+\.[0-9]+' "$f" | head -1)"
+    if [ -n "$iv" ] && ver_ge "$iv" 8.83; then ok "Imunify360 WAF rules $iv (>= 8.83, has the php2shell rule; interim only): $f"
+    else err "Imunify360 WAF rules ${iv:-unknown} are older than 8.83: imunify360-agent update --force modsec-rules"; fi
+  done
 
   # Updated on disk but the old code is still running: the update does not count until a restart
   stale="$(stale_php | awk '{printf "%s%s (%s)", (NR>1?", ":""), $2, $1}')"
