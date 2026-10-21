@@ -50,7 +50,17 @@ POOL_OFF_RE="^[[:space:]]*${POOL_RE}[[:space:]]*=[[:space:]]*\"?(off|0|false|no|
 
 CHANGED=0; SKIPPED=0; FAILED=0
 
-backup() { cp -p "$1" "$1.bak-$TS"; }
+# Refuse to touch files in directories a non-root user could write to (symlink planting),
+# and never write the backup through an existing file or symlink.
+backup() {
+  local dir dst="$1.bak-$TS"
+  dir="$(dirname "$1")"
+  if [ "$(stat -c %u "$dir" 2>/dev/null)" != "0" ] || [ -n "$(find "$dir" -maxdepth 0 -perm /022 2>/dev/null)" ]; then
+    err "Unsafe directory (not root-owned or group/world-writable), skipping: $dir"; return 1
+  fi
+  if [ -e "$dst" ] || [ -L "$dst" ]; then err "Backup path already exists: $dst"; return 1; fi
+  cp -p --no-dereference "$1" "$dst"
+}
 
 # Expands to the array contents, or nothing if empty (safe under `set -u` on bash < 4.4, e.g. CentOS 7)
 # usage: for x in ${ARR[@]+"${ARR[@]}"}; do ...
