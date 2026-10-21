@@ -18,7 +18,7 @@
 
 set -u
 
-VERSION="1.11.0"
+VERSION="1.11.1"
 DIRECTIVE="session.upload_progress.enabled"
 TS="$(date +%Y%m%d-%H%M%S)"
 MODE=fix
@@ -604,7 +604,7 @@ update_hints() {
     rocky:*)
       info "  Rocky Linux follows RHEL errata (RHSA-2026:87072: php:8.2 on 9). Others: dnf updateinfo list --security" ;;
     amzn:*)
-      info "  Amazon Linux 2023: no fixed PHP package yet (github.com/amazonlinux/amazon-linux-2023/issues/1148)."
+      info "  Amazon Linux 2023: no fixed PHP package on 21 Oct; AWS Security Bulletin 2026-143-aws targets 22 Oct."
       info "    Watch https://explore.alas.aws.amazon.com/CVE-2026-109618.html; keep this mitigation and the edge rules." ;;
     alpine:*)
       info "  Alpine: php83 8.3.36-r0, php84 8.4.27-r0, php85 8.5.12-r0 on 3.24 and edge. Older branches: check secdb.alpinelinux.org" ;;
@@ -622,7 +622,12 @@ update_hints() {
   fi
   if [ "$pm" = apt ]; then
     if grep -rqs 'packages.sury.org' /etc/apt/sources.list /etc/apt/sources.list.d; then
-      info "  packages.sury.org repository detected (gets fixes first for Debian / Ubuntu; arm64 builds came later than amd64)."
+      info "  packages.sury.org repository detected (gets fixes first for Debian / Ubuntu on amd64)."
+      if [ "$(dpkg --print-architecture 2>/dev/null)" = arm64 ]; then
+        info "    arm64: sury's arm64 builds were still the old 8.2.34 / 8.3.35 / 8.4.26 / 8.5.11 on 21 Oct (21:20 UTC)."
+        info "    Keep this mitigation until apt-cache policy shows 8.2.35 / 8.3.36 / 8.4.27 / 8.5.12. On Ubuntu,"
+        info "    ppa:ondrej/php already has fixed arm64 builds of all four branches."
+      fi
     elif grep -rqs 'ondrej/php' /etc/apt/sources.list /etc/apt/sources.list.d; then
       info "  ppa:ondrej/php (Launchpad) can lag behind packages.sury.org (arm64: 8.4 / 8.5 later). If apt offers no fixed build yet,"
       info "    switching to https://packages.sury.org/php/ gets it sooner."

@@ -35,7 +35,7 @@ curl -fsSL https://raw.githubusercontent.com/ersinkoc/php-fix/main/install.sh | 
 Piping `main` into `sudo bash` means trusting whatever is on `main` at that moment. For production, use a release instead. Every release is built by GitHub Actions and ships with a `SHA256SUMS` file and a signed [build provenance attestation](https://docs.github.com/actions/security-for-github-actions/using-artifact-attestations):
 
 ```bash
-V=v1.11.0
+V=v1.11.1
 curl -fsSLO https://github.com/ersinkoc/php-fix/releases/download/$V/install.sh
 curl -fsSLO https://github.com/ersinkoc/php-fix/releases/download/$V/SHA256SUMS
 sha256sum -c SHA256SUMS                                      # integrity
@@ -110,7 +110,7 @@ With curl, pass options like this: `curl -fsSL .../install.sh | sudo bash -s -- 
 
 ## `--audit`: what it looks at
 
-This is a heuristic sweep, not proof either way. Every finding needs a human to look at it.
+This is a heuristic sweep, not proof either way. Every finding needs a human to look at it. Datadog reports that a successful exploit can return a normal **HTTP 200** and leave the worker running, so a clean access log doesn't rule out compromise.
 
 - PHP / `.htaccess` / `.user.ini` files changed in web roots within the window (listed for review; CMS updates are normal noise)
 - Webshell-like code in those files (`eval(base64_decode(...))`, `system($_POST...)`, and similar)
@@ -229,7 +229,7 @@ It compares a multipart POST, a multipart PUT and a mixed-case `Content-Type` ag
 
 Control panels and several repositories ship **their own PHP builds**. `apt upgrade` / `dnf upgrade` doesn't touch Plesk's, cPanel's, DirectAdmin's or CloudLinux's PHP. One server can have several of these side by side. `--check` lists every PHP it finds, detects where each one comes from, and prints the update command for that source.
 
-### Where the fixed builds are (as of 21 October 2026, ~21:30 UTC)
+### Where the fixed builds are (as of 21 October 2026, ~22:00 UTC)
 
 This changes hour by hour. Check the vendor's page, then confirm with `--check`.
 
@@ -245,14 +245,14 @@ This changes hour by hour. Check the vendor's page, then confirm with `--check`.
 | **Imunify360** WAF (cPanel, Plesk, CloudLinux) | ModSecurity vendor rules | ✅ ruleset **8.83** blocks the public exploit shape on Apache (LiteSpeed: logs only); 8.84 / 8.85 followed, and scanning IPs get a CAPTCHA. Interim only | `imunify360-agent update --force modsec-rules`. `--check` reports the installed ruleset version |
 | **Cloudflare** WAF | edge | ✅ temporary rules for the known exploit vectors, for all plans including Free. Only covers traffic that goes through Cloudflare; the CTO calls it "a STOPGAP only" | nothing to do; lock the origin to Cloudflare IPs, or the rules can be bypassed |
 | **Check Point** IPS / WAF | gateway | ✅ IPS protection CPAI-2026-15172 | set new critical protections to Prevent. TLS traffic must be inspected |
-| **packages.sury.org** (Debian 12/13, Ubuntu 22.04/24.04) | `/etc/php/X.Y` | ✅ 8.2–8.5 on amd64. ⏳ **arm64 still on the old builds** (20:46 UTC) | `apt-get install --only-upgrade 'php8.3*'`. On arm64, check `apt-cache policy php8.3` |
-| **ppa:ondrej/php** (Launchpad) | `/etc/php/X.Y` | ✅ amd64: 8.2–8.5. arm64: 8.2 / 8.3 / 8.4, ⏳ 8.5 | `apt upgrade` |
+| **packages.sury.org** (Debian 12/13, Ubuntu 22.04/24.04) | `/etc/php/X.Y` | ✅ 8.2–8.5 on amd64. ⏳ **arm64 still on the old builds** (checked 21:20 UTC: 8.2.34 / 8.3.35 / 8.4.26 / 8.5.11). `--check` warns on arm64 hosts | `apt-get install --only-upgrade 'php8.3*'`. On arm64, check `apt-cache policy php8.3` |
+| **ppa:ondrej/php** (Launchpad) | `/etc/php/X.Y` | ✅ 8.2–8.5 on amd64 and arm64 (arm64 8.5 since 21:22 UTC) | `apt upgrade`. Ubuntu on arm64: this is the fixed source while sury's arm64 lags |
 | **Ubuntu** own packages | `/etc/php/X.Y` | ✅ every release, including ESM ([USN-8948-1 / -2](https://ubuntu.com/blog/php2shell-vulnerability-fixes-available)). See [Ubuntu](#ubuntu) below | `apt upgrade` |
 | **Debian** own packages | `/etc/php/X.Y` | ✅ 13 trixie `8.4.27-1~deb13u1` ([DSA-6574-1](https://security-tracker.debian.org/tracker/CVE-2026-109618)), ✅ 12 bookworm `8.2.35-1~deb12u1` (DLA-4848-1). ⏳ forky / sid. 11: no free fix | `apt upgrade` |
 | **RHEL / Rocky** AppStream | `/etc/php.ini` | 🔄 [RHSA-2026:87072](https://access.redhat.com/errata/RHSA-2026:87072): php:8.2 on RHEL 9 → `php-8.2.35-1.module+el9.8.0+25111+a1450321`. ⏳ other streams and RHEL 8 / 10 ([RHSB-2026-013](https://access.redhat.com/security/vulnerabilities/RHSB-2026-013), "ongoing"). RHEL 7 is not affected per Red Hat. UBI-based images: rebuild when the base image updates | `dnf upgrade 'php*'`, `dnf updateinfo list --security` |
 | **AlmaLinux** | `/etc/php.ini` | 🔄 [every stream in **almalinux-testing**](https://almalinux.org/blog/2026-10-21-php2shell-cve-2026-109618-cve-2026-109619/) (retired ones too), production next. Old version numbers with `.alma.1`, e.g. 9: `php-8.0.30-8.el9_8.alma.1`, 10: `php-8.3.33-1.el10_2.alma.1`. 8 php:7.4 (`php-7.4.33-8.module_el8.10.0+4321+cf5fd4bb`) is already in production | `dnf install -y almalinux-release-testing && dnf upgrade 'php*' --enablerepo=almalinux-testing`. Check with `rpm -q php-common`, not `php -v` |
-| **Amazon Linux 2023** | `/etc/php.ini` | ❌ no fixed package yet ([issue #1148](https://github.com/amazonlinux/amazon-linux-2023/issues/1148)). Elastic Beanstalk's managed update only applied settings, not a new PHP | watch [ALAS](https://explore.alas.aws.amazon.com/CVE-2026-109618.html) |
-| **Alpine** | `/etc/php8X` | ✅ 3.24 (x86_64, aarch64) and edge x86_64: php83 `8.3.36-r0`, php84 `8.4.27-r0`, php85 `8.5.12-r0` ([secdb](https://secdb.alpinelinux.org/)). ⏳ edge aarch64. ❌ 3.23 and older won't get a fix (Alpine developer) | `apk upgrade`; on 3.23 and older, move to 3.24 |
+| **Amazon Linux 2023** | `/etc/php.ini` | ❌ no fixed package on 21 Oct ([issue #1148](https://github.com/amazonlinux/amazon-linux-2023/issues/1148)). AWS Security Bulletin 2026-143-aws targets updated PHP packages for **22 Oct**. Elastic Beanstalk's managed update only applied settings, not a new PHP | watch [ALAS](https://explore.alas.aws.amazon.com/CVE-2026-109618.html) |
+| **Alpine** | `/etc/php8X` | ✅ 3.24 and edge (x86_64, aarch64): php83 `8.3.36-r0`, php84 `8.4.27-r0`, php85 `8.5.12-r0` ([secdb](https://secdb.alpinelinux.org/)). ❌ 3.23 and older won't get a fix (Alpine developer) | `apk upgrade`; on 3.23 and older, move to 3.24 |
 | **Remi** | `/etc/opt/remi`, `/opt/remi` | ✅ 8.2.35 / 8.3.36 / 8.4.27 / 8.5.12 on rpms.remirepo.net (21 Oct, evening). Some mirrors lag. The earlier 8.4.27RC1 / 8.5.12RC1 builds do **not** contain the fix | `dnf clean metadata && dnf upgrade 'php*'` (SCL: `'php8[0-9]-*'`) |
 | **Docker `php` image** | inside the image | ✅ `8.2.35`, `8.3.36`, `8.4.27`, `8.5.12` tags on Docker Hub (from 21 Oct, ~17:30 UTC). `*RC1` tags don't contain the fix | `docker build --pull`, then `docker compose up -d --force-recreate`. Check with `docker run --rm php:8.4-fpm php -v` |
 | Gentoo / Arch / Homebrew / windows.php.net | — | ✅ (Arch: 8.3, 8.5 only) | package manager / download |
@@ -450,6 +450,7 @@ Timeline note: the fix and advisories are public, so the patch diff now shows at
 - [AlmaLinux: php2shell patches (testing package versions)](https://almalinux.org/blog/2026-10-21-php2shell-cve-2026-109618-cve-2026-109619/)
 - [RHSA-2026:87072: php:8.2 on RHEL 9](https://access.redhat.com/errata/RHSA-2026:87072)
 - [Red Hat bulletin RHSB-2026-013](https://access.redhat.com/security/vulnerabilities/RHSB-2026-013)
+- [Datadog Security Labs: detection, analysis and remediation](https://securitylabs.datadoghq.com/articles/php2shell-critical-vulnerabilities-in-php/)
 - [Cloudflare: php2shell WAF protection](https://blog.cloudflare.com/php-vulnerabilities-waf-protection/)
 - [php2shell.com: overview, signals and after-patch notes](https://www.php2shell.com/)
 - [Amazon Linux 2023 issue #1148](https://github.com/amazonlinux/amazon-linux-2023/issues/1148)
