@@ -18,6 +18,11 @@
 
 set -u
 
+OS="$(uname -s)"
+# FreeBSD ports/packages live in /usr/local; sudo/doas/su may have dropped it from PATH.
+case ":$PATH:" in *:/usr/local/sbin:*) ;; *) PATH="$PATH:/usr/local/sbin" ;; esac
+case ":$PATH:" in *:/usr/local/bin:*) ;; *) PATH="$PATH:/usr/local/bin" ;; esac
+
 VERSION="1.11.1"
 DIRECTIVE="session.upload_progress.enabled"
 TS="$(date +%Y%m%d-%H%M%S)"
@@ -156,8 +161,9 @@ map $uri $php2shell_upload_ok {
 
 ############ Apache 2.4 — multipart only on allowlisted paths (server-wide, all vhosts) ############
 # Save as /etc/apache2/conf-enabled/zz-php2shell-waf.conf (Debian/Ubuntu),
-# /etc/httpd/conf.d/zz-php2shell-waf.conf (RHEL) or /etc/apache2/conf.d/zz-php2shell-waf.conf
-# (cPanel), then `apachectl -t && apachectl graceful`. No mod_rewrite needed.
+# /etc/httpd/conf.d/zz-php2shell-waf.conf (RHEL), /etc/apache2/conf.d/zz-php2shell-waf.conf
+# (cPanel) or /usr/local/etc/apache24/Includes/zz-php2shell-waf.conf (FreeBSD),
+# then `apachectl -t && apachectl graceful`. No mod_rewrite needed.
 # The <If> sits inside <Location "/">, which Apache merges AFTER .htaccess files: a
 # `Require all granted` or `RewriteEngine On` in any .htaccess cannot undo it.
 # (A bare top-level <If> CAN be overridden by .htaccess. Keep the <Location> wrapper.)
@@ -206,12 +212,13 @@ EOF
 fi
 
 if [ "$(id -u)" -ne 0 ] && [ "$DRY_RUN" -eq 0 ] && { [ "$MODE" = fix ] || [ "$MODE" = revert ]; }; then
-  err "Run as root: curl ... | sudo bash"
+  err "Run as root: curl ... | sudo bash   (FreeBSD: as root, or doas/sudo, piped into bash)"
   exit 1
 fi
 
 # Known PHP locations for distros and control panels
-# (Debian/Ubuntu, RHEL/Remi, cPanel EA, CloudLinux alt-php, Plesk, aaPanel, LiteSpeed, DirectAdmin)
+# (Debian/Ubuntu, RHEL/Remi, cPanel EA, CloudLinux alt-php, Plesk, aaPanel, LiteSpeed, DirectAdmin,
+#  FreeBSD ports/pkg: /usr/local/etc/php.ini, /usr/local/etc/php/, /usr/local/etc/php-fpm.d/)
 SEARCH_ROOTS=(/etc /usr/local/etc /usr/local/lib /usr/local/php* /opt/cpanel /opt/alt /opt/plesk/php /opt/remi /etc/opt/remi /www/server/php /usr/local/lsws)
 
 existing_roots=()
@@ -222,14 +229,49 @@ ANY_RE="^[[:space:]]*;?[[:space:]]*${DIRECTIVE//./\\.}[[:space:]]*="
 OFF_RE="^[[:space:]]*${DIRECTIVE//./\\.}[[:space:]]*=[[:space:]]*\"?(off|0|false|no|none)?\"?[[:space:]]*(;.*)?$"
 POOL_RE="php_(admin_)?(value|flag)\[${DIRECTIVE//./\\.}\]"
 POOL_OFF_RE="^[[:space:]]*${POOL_RE}[[:space:]]*=[[:space:]]*\"?(off|0|false|no|none)?\"?[[:space:]]*(;.*)?$"
-MODPHP_CONFS=(/etc/apache2/conf-available/zz-php2shell.conf /etc/httpd/conf.d/zz-php2shell.conf /etc/apache2/conf.d/zz-php2shell.conf)
+MODPHP_CONFS=(/etc/apache2/conf-available/zz-php2shell.conf /etc/httpd/conf.d/zz-php2shell.conf /etc/apache2/conf.d/zz-php2shell.conf
+              /usr/local/etc/apache24/Includes/zz-php2shell.conf)
 
 CHANGED=0; SKIPPED=0; FAILED=0
+
+# ---------------------------------------------------------------------------
+# Portability: GNU/Linux and FreeBSD differ in stat, cp, sed -i, xargs -d, ps -e, /proc and /run.
+# ---------------------------------------------------------------------------
+if [ "$OS" = FreeBSD ]; then owner_uid() { stat -f %u "$1" 2>/dev/null; }
+else owner_uid() { stat -c %u "$1" 2>/dev/null; }; fi
+# cp_keep <src> <dst>: copy keeping mode/owner/times. Never copies a symlink
+# (BSD cp has no --no-dereference; every source here is a regular file anyway).
+cp_keep() { [ -L "$1" ] && { err "Refusing to copy a symlink: $1"; return 1; }; cp -p "$1" "$2"; }
+# edit_i <file> <command...>: in-place edit that works with GNU and BSD tools (`sed -i` syntax differs).
+# Output goes to a temp file in the same directory with the original's mode/owner, then an atomic mv.
+edit_i() {
+  local f="$1" tmp; shift
+  tmp="$(mktemp "$f.php-fix.XXXXXX")" || return 1
+  if cp -p "$f" "$tmp" && "$@" "$f" > "$tmp" && mv -f "$tmp" "$f"; then return 0; fi
+  rm -f "$tmp"; return 1
+}
+# Every line this script writes into a config file gets this comment right above it.
+MARK="emergency mitigation for php2shell (CVE-2026-109618 / CVE-2026-109619)"
+INI_MARK="; $MARK"      # php.ini, conf.d, FPM pools, .user.ini
+APACHE_MARK="# $MARK"   # Apache config
+# has_mark <file>: a file php-fix wrote itself (old "php-fix:" header or the current comment)
+has_mark() { grep -Eq '^[;#] (php-fix:|emergency mitigation for php2shell)' "$1" 2>/dev/null; }
+# mark_i <file> <line>: put INI_MARK above every <line> (ignoring indentation) that lacks it
+mark_i() {
+  edit_i "$1" awk -v l="$2" -v c="$INI_MARK" \
+    '{ t = $0; sub(/^[[:space:]]+/, "", t) } t == l && prev != c { print c } { print; prev = t }'
+}
+# newline-separated list -> NUL-separated, for xargs -0 (BSD xargs has no -d)
+nl2nul() { tr '\n' '\0'; }
+# ps_all <ps -o ...>: every process. On FreeBSD `ps -e` means "show environment", not "all processes".
+if [ "$OS" = FreeBSD ]; then ps_all() { ps -axww "$@"; }; else ps_all() { ps -e "$@"; }; fi
+ps_args() { ps -ww -o args= -p "$1" 2>/dev/null | cut -c1-150; }
+RUN_BASE=/run; [ -d /run ] || RUN_BASE=/var/run      # FreeBSD has no /run
 
 # Refuse to write in directories a non-root user could write to (symlink planting).
 dir_safe() {
   local dir; dir="$(dirname "$1")"
-  if [ "$(stat -c %u "$dir" 2>/dev/null)" != "0" ] || [ -n "$(find "$dir" -maxdepth 0 -perm /022 2>/dev/null)" ]; then
+  if [ "$(owner_uid "$dir")" != "0" ] || [ -n "$(find "$dir" -maxdepth 0 \( -perm -020 -o -perm -002 \) 2>/dev/null)" ]; then
     err "Unsafe directory (not root-owned or group/world-writable), skipping: $dir"; return 1
   fi
 }
@@ -239,7 +281,7 @@ backup() {
   local dst="$1.bak-$TS"
   dir_safe "$1" || return 1
   if [ -e "$dst" ] || [ -L "$dst" ]; then err "Backup path already exists: $dst"; return 1; fi
-  cp -p --no-dereference "$1" "$dst"
+  cp_keep "$1" "$dst"
 }
 
 APACHECTL="$(command -v apachectl || command -v apache2ctl || command -v httpd || true)"
@@ -260,6 +302,14 @@ reload_services() {
     for s in ${SVCS[@]+"${SVCS[@]}"}; do
       case "$s" in apache2.service|httpd.service) [ "$apache_ok" -eq 1 ] || continue ;; esac
       systemctl reload-or-restart "$s" && ok "Reloaded: $s" || err "Could not reload: $s"
+    done
+  elif [ "$OS" = FreeBSD ]; then
+    # rc.d names: php_fpm (php-fpm on old ports), apache24. one* works whether or not *_enable is set.
+    for s in php_fpm php-fpm apache24; do
+      [ -x "/usr/local/etc/rc.d/$s" ] || continue
+      service "$s" onestatus >/dev/null 2>&1 || continue
+      case "$s" in apache24) [ "$apache_ok" -eq 1 ] || continue ;; esac
+      service "$s" onereload >/dev/null 2>&1 && ok "Reloaded: $s" || err "Could not reload: $s"
     done
   else
     for s in php-fpm php7.4-fpm php8.0-fpm php8.1-fpm php8.2-fpm php8.3-fpm php8.4-fpm php8.5-fpm apache2 httpd; do
@@ -324,6 +374,8 @@ scan_dir() {
 # (GHSA-6wmf-4rv5-p3rp, the confirmed mod_php RCE). Off only drops the backtrace from the message.
 FEB=fatal_error_backtraces
 FEB_INI=zz-php2shell.ini
+# drop-in for binaries that load no php.ini at all (FreeBSD ships only php.ini-production/-development)
+UPL_INI=zz-php2shell-upload.ini
 
 # major*100+minor of a version string, or empty
 branch_num() { local ma mi; IFS=. read -r ma mi _ <<< "$1"; case "$ma$mi" in *[!0-9]*|'') return ;; esac; echo $((ma*100+mi)); }
@@ -432,8 +484,8 @@ echo preg_match("/PHPFIX:[^\r\n]*/", $out, $m) ? $m[0] : "ERR:no-answer";'
 find_pool_files() {
   [ ${#existing_roots[@]} -gt 0 ] || return 0
   find "${existing_roots[@]}" -xdev -type f -name '*.conf' -print0 2>/dev/null \
-    | xargs -0 -r grep -lE '^[[:space:]]*listen[[:space:]]*=' 2>/dev/null \
-    | xargs -d '\n' -r grep -lE '^[[:space:]]*pm[[:space:]]*=' 2>/dev/null | sort -u
+    | xargs -0 -r grep -lE '^[[:space:]]*listen[[:space:]]*=' 2>/dev/null | nl2nul \
+    | xargs -0 -r grep -lE '^[[:space:]]*pm[[:space:]]*=' 2>/dev/null | sort -u
 }
 
 # prints "<pool>|<address>|<PHP_VERSION>|<value>" or "<pool>|<address>|ERR|<reason>"
@@ -441,14 +493,17 @@ fcgi_pools() {
   [ "$(id -u)" -eq 0 ] || return 0
   local cli dir pool addr out f
   cli="$(find_php_bins | head -1)"; [ -n "$cli" ] || return 0
-  dir="/run/php-fix.$$"
+  dir="$RUN_BASE/php-fix.$$"
   mkdir -m 755 "$dir" 2>/dev/null || return 0
   printf '%s' "$FCGI_CLIENT" > "$dir/client.php"
   echo "<?php echo 'PHPFIX:'.PHP_VERSION.'|'.ini_get('${DIRECTIVE}');" > "$dir/check.php"
   chmod 644 "$dir/check.php"
   while read -r f; do
-    awk -F'=' '/^[[:space:]]*\[[^]]+\][[:space:]]*$/ { gsub(/[][[:space:]]/, ""); pool=$0 }
-               /^[[:space:]]*listen[[:space:]]*=/ && pool != "global" { v=$2; gsub(/^[[:space:]]+|[[:space:]]+$/, "", v); print pool "|" v }' "$f"
+    awk -F'=' '/^[[:space:]]*\[.+\][[:space:]]*$/ { pool=$0; gsub(/[[:space:]]/, "", pool); gsub(/^\[|\]$/, "", pool) }
+               /^[[:space:]]*listen[[:space:]]*=/ && pool != "global" {
+                 v=$2; gsub(/^[[:space:]]+|[[:space:]]+$/, "", v); gsub(/^"|"$/, "", v)
+                 while ((i = index(v, "$pool")) > 0) v = substr(v, 1, i - 1) pool substr(v, i + 5)
+                 print pool "|" v }' "$f"
   done < <(find_pool_files) | sort -u | while IFS='|' read -r pool addr; do
     case "$addr" in
       /*)          [ -S "$addr" ] || { echo "$pool|$addr|ERR|not running"; continue; } ;;
@@ -510,9 +565,10 @@ if [ "$MODE" = userini ]; then
   else
     if [ -f "$f" ]; then cp -p "$f" "$f.bak-$TS" || { err "Backup failed: $f"; exit 1; }; fi
     if [ -f "$f" ] && grep -Eiq "$ANY_RE" "$f"; then
-      sed -i -E "s/${ANY_RE}.*/${DIRECTIVE} = 0/I" "$f"
+      { edit_i "$f" sed -E "s/${ANY_RE}.*/${DIRECTIVE} = 0/I" && mark_i "$f" "${DIRECTIVE} = 0"; } \
+        || { err "Could not update: $f"; exit 1; }
     else
-      printf '\n; php-fix: php2shell (CVE-2026-109618 / CVE-2026-109619) mitigation\n%s = 0\n' "$DIRECTIVE" >> "$f"
+      printf '\n%s\n%s = 0\n' "$INI_MARK" "$DIRECTIVE" >> "$f"
     fi
     ok "Wrote ${DIRECTIVE} = 0 to $f$([ -f "$f.bak-$TS" ] && echo "  (backup: $f.bak-$TS)")"
   fi
@@ -559,6 +615,16 @@ classify() {
 # Prints "count name" lines. Read-only; as non-root only own processes are visible.
 stale_php() {
   local p c
+  if [ "$OS" = FreeBSD ]; then
+    # No /proc: procstat -v lists every mapping; a vnode mapping (TP "vn") without a path is a
+    # deleted file, e.g. a binary or extension replaced by pkg upgrade. Best effort.
+    command -v procstat >/dev/null 2>&1 || return 0
+    ps -axo pid=,comm= 2>/dev/null | while read -r p c; do
+      case "$c" in php*|lsphp*|httpd|frankenphp|litespeed|lshttpd|openlitespeed) ;; *) continue ;; esac
+      procstat -v "$p" 2>/dev/null | awk 'NR>1 && $10=="vn" && NF<11 {f=1} END {exit !f}' && echo "$c"
+    done | sort | uniq -c | awk '{print $1, $2}'
+    return
+  fi
   for p in /proc/[0-9]*; do
     c="$(cat "$p/comm" 2>/dev/null)" || continue
     case "$c" in php*|lsphp*|apache2|httpd|frankenphp|litespeed|lshttpd|openlitespeed) ;; *) continue ;; esac
@@ -620,6 +686,14 @@ update_hints() {
     info "  Remi: ${pm:-dnf} upgrade 'php*' (module stream) or 'php8[0-9]-*' (SCL /opt/remi). 8.2.35 / 8.3.36 / 8.4.27 / 8.5.12"
     info "    are on rpms.remirepo.net since 21 Oct. Some mirrors lag: ${pm:-dnf} clean metadata, then upgrade again."
   fi
+  if [ "$OS" = FreeBSD ]; then
+    info "  FreeBSD packages: pkg update && pkg upgrade -g 'php*'   (ports: update the tree, rebuild lang/phpXY + extensions)"
+    info "    The quarterly repo gets fixes later than latest (pkg -vv shows which one is used)."
+    info "    pkg audit -F lists installed packages with known vulnerabilities."
+    if command -v jls >/dev/null 2>&1 && [ -n "$(jls jid 2>/dev/null)" ]; then
+      info "  Jails: upgrade inside each one too (pkg -j <jail> upgrade -g 'php*'), then run php-fix inside it."
+    fi
+  fi
   if [ "$pm" = apt ]; then
     if grep -rqs 'packages.sury.org' /etc/apt/sources.list /etc/apt/sources.list.d; then
       info "  packages.sury.org repository detected (gets fixes first for Debian / Ubuntu on amd64)."
@@ -653,6 +727,7 @@ update_hints() {
   info "    $UBUNTU_USN and reads other distros' package changelogs."
   info "Then restart every PHP worker: FPM (systemctl restart php*-fpm), Apache with mod_php (full restart,"
   info "  not a graceful reload), LiteSpeed, queue / Octane / long-running PHP workers, or reboot. Run --check again."
+  [ "$OS" = FreeBSD ] && info "  FreeBSD: service php_fpm restart; service apache24 restart (mod_php)."
 }
 
 JSON_ROWS=()
@@ -702,11 +777,23 @@ if [ "$MODE" = check ]; then
     done < <(docker ps --format '{{.Names}}' 2>/dev/null)
   fi
 
+  # PHP inside running FreeBSD jails (read-only jexec; the host run does not reach them)
+  if [ "$OS" = FreeBSD ] && [ "$(id -u)" -eq 0 ] && command -v jls >/dev/null 2>&1; then
+    while read -r jid name; do
+      [ -n "$jid" ] || continue
+      out="$(timeout 15 jexec "$jid" env PATH=/usr/local/bin:/usr/bin:/bin php -r "echo PHP_VERSION,'|',ini_get('${DIRECTIVE}');" 2>/dev/null)" || continue
+      classify "${out%%|*}" "${out#*|}"
+      report jail "$name" "${out%%|*}" "$STATUS" "$MIT" "$NOTE Run php-fix inside the jail (jexec $name), the host run does not touch it."
+      [ "$STATUS" = PATCHED ] || UNPATCHED=1
+    done < <(jls jid name 2>/dev/null)
+  fi
+
   # Held / version-locked packages silently skip the security update
   held=""
   command -v apt-mark >/dev/null 2>&1 && held="$(apt-mark showhold 2>/dev/null | grep -i php)"
   command -v dnf >/dev/null 2>&1 && held="$held $(dnf -q versionlock list 2>/dev/null | grep -i php)"
   command -v yum >/dev/null 2>&1 && ! command -v dnf >/dev/null 2>&1 && held="$held $(yum -q versionlock list 2>/dev/null | grep -i php)"
+  [ "$OS" = FreeBSD ] && command -v pkg >/dev/null 2>&1 && held="$held $(pkg lock -lq 2>/dev/null | grep -i php)"
   held="$(echo $held)"
   if [ -n "$held" ]; then
     UNPATCHED=1
@@ -751,11 +838,15 @@ if [ "$MODE" = audit ]; then
   flag() { err "$*"; FINDINGS=$((FINDINGS+1)); }
   info "php-fix $VERSION audit, last ${AUDIT_HOURS}h (read-only, heuristic: findings need human review)"
   command -v ps >/dev/null 2>&1 || err "ps not found (install procps): process checks are SKIPPED"
-  command -v ss >/dev/null 2>&1 || info "ss not found (install iproute2): network check skipped"
+  if [ "$OS" = FreeBSD ]; then command -v sockstat >/dev/null 2>&1 || info "sockstat not found: network check skipped"
+  else command -v ss >/dev/null 2>&1 || info "ss not found (install iproute2): network check skipped"; fi
 
   WEBROOTS=()
-  for r in /var/www /srv/www /srv/http /home /www/wwwroot /usr/share/nginx/html /usr/local/lsws/Example/html; do
-    [ -d "$r" ] && WEBROOTS+=("$r")
+  for r in /var/www /srv/www /srv/http /home /usr/home /usr/local/www /www/wwwroot /usr/share/nginx/html /usr/local/lsws/Example/html; do
+    [ -d "$r" ] || continue
+    r="$(readlink -f "$r")"   # FreeBSD: /home -> /usr/home, and find does not descend a symlinked start path
+    case " ${WEBROOTS[*]+${WEBROOTS[*]}} " in *" $r "*) continue ;; esac
+    WEBROOTS+=("$r")
   done
 
   # 1) Recently changed PHP / per-dir config in web roots (CMS updates are normal noise)
@@ -782,8 +873,8 @@ if [ "$MODE" = audit ]; then
 
   # 4) Shells / interpreters spawned by PHP or the web server
   while read -r pid comm parent; do
-    flag "Process $pid ($comm) spawned by $parent: $(ps -o args= -p "$pid" 2>/dev/null | cut -c1-150)"
-  done < <(ps -eo pid=,ppid=,comm= 2>/dev/null | awk '
+    flag "Process $pid ($comm) spawned by $parent: $(ps_args "$pid")"
+  done < <(ps_all -o pid=,ppid=,comm= 2>/dev/null | awk '
     { pid[NR]=$1; ppid[NR]=$2; comm[NR]=$3; name[$1]=$3 }
     END { for (i=1;i<=NR;i++)
             if (comm[i] ~ /^(sh|bash|dash|zsh|ksh|nc|ncat|netcat|socat|python[0-9.]*|perl|ruby|telnet|curl|wget)$/ &&
@@ -799,19 +890,19 @@ if [ "$MODE" = audit ]; then
   for d in $(printf '%s\n' "${SESS_DIRS[@]}" /var/cpanel/php/sessions/* /opt/alt/php*/var/lib/php/session | sort -u); do
     [ -d "$d" ] || continue
     c="$("${NICE[@]}" find "$d" -maxdepth 1 -type f -name 'sess_*' -mmin "-$MIN" -print0 2>/dev/null \
-      | xargs -0 -r grep -ls 'upload_progress_' 2>/dev/null | wc -l)"
+      | xargs -0 -r grep -ls 'upload_progress_' 2>/dev/null | wc -l | tr -d ' ')"
     [ "$c" -gt 0 ] && flag "$c recent session file(s) with upload_progress_ data in $d (feature was used; legit progress bars or probing)"
   done
 
   # 6) Recently changed cron jobs (common persistence)
   while read -r f; do [ -n "$f" ] && flag "Cron changed recently: $f"; done < <(find /etc/crontab /etc/cron.d /etc/cron.hourly \
-    /etc/cron.daily /var/spool/cron -xdev -type f -mmin "-$MIN" 2>/dev/null)
+    /etc/cron.daily /var/spool/cron /var/cron/tabs /usr/local/etc/cron.d -xdev -type f -mmin "-$MIN" 2>/dev/null)
 
   # 7) Busiest POST clients to .php in current access logs (context only, not a finding)
   LOGS=()
   for l in /var/log/apache2/*access*.log /var/log/httpd/*access_log /var/log/nginx/*access*.log \
            /usr/local/apache/domlogs/*/* /var/www/vhosts/*/logs/access*log /usr/local/lsws/logs/access.log \
-           /www/wwwlogs/*.log; do
+           /www/wwwlogs/*.log /var/log/httpd-access.log; do
     case "$l" in *.gz|*.bz2|*.xz|*.zip) continue ;; esac
     [ -f "$l" ] && LOGS+=("$l")
   done
@@ -824,22 +915,29 @@ if [ "$MODE" = audit ]; then
     if [ -n "$MP" ]; then
       info "Top multipart senders (Content-Type is logged):"
       printf '%s\n' "$MP" | awk '{print $1}' | sort | uniq -c | sort -rn | head -10 | sed 's/^/     /'
-      c5="$(printf '%s\n' "$MP" | awk '$9 ~ /^50[0-4]$/' | wc -l)"
+      c5="$(printf '%s\n' "$MP" | awk '$9 ~ /^50[0-4]$/' | wc -l | tr -d ' ')"
       [ "$c5" -gt 0 ] && flag "$c5 multipart request(s) answered with 500-504 (worker crashes under multipart = exploitation attempts?)"
     fi
   fi
 
   # 8) PHP worker crashes: memory-corruption exploits usually crash workers while they are being tuned
-  CRASH_RE='exited on signal (6|7|11)|SIGSEGV|SIGBUS|Segmentation fault|exit signal Aborted'
+  # SIGBUS is 7 on Linux, 10 on FreeBSD
+  if [ "$OS" = FreeBSD ]; then CRASH_RE='exited on signal (6|10|11)|SIGSEGV|SIGBUS|Segmentation fault|exit signal Aborted'
+  else CRASH_RE='exited on signal (6|7|11)|SIGSEGV|SIGBUS|Segmentation fault|exit signal Aborted'; fi
   for l in /var/log/php*-fpm.log /var/log/php-fpm/*log /opt/cpanel/ea-php*/root/usr/var/log/php-fpm.log \
            /opt/remi/php*/root/var/log/php-fpm/*log /opt/plesk/php/*/var/log/php-fpm.log \
            /www/server/php/*/var/log/php-fpm.log /var/log/apache2/error*.log /var/log/httpd/error_log \
-           /usr/local/apache/logs/error_log /usr/local/lsws/logs/error.log; do
+           /usr/local/apache/logs/error_log /usr/local/lsws/logs/error.log /var/log/httpd-error.log; do
     [ -f "$l" ] || continue
     c="$("${NICE[@]}" tail -n 200000 "$l" 2>/dev/null | grep -Eic "$CRASH_RE")"
     [ "$c" -gt 0 ] && flag "$c PHP/web worker crash line(s) in $l (check timestamps; repeated crashes = exploitation attempts?)"
   done
-  if command -v journalctl >/dev/null 2>&1; then
+  if [ "$OS" = FreeBSD ]; then
+    # kernel: "pid 123 (php-fpm), jid 0, uid 80: exited on signal 11 (core dumped)"
+    KRE='\((php[^)]*|lsphp[^)]*|httpd|frankenphp)\), (jid [0-9]+, )?uid [0-9]+: exited on signal (6|10|11)'
+    if [ -r /var/log/messages ]; then kc="$("${NICE[@]}" tail -n 200000 /var/log/messages 2>/dev/null | grep -Ec "$KRE")"
+    else kc="$(dmesg -a 2>/dev/null | grep -Ec "$KRE")"; fi
+  elif command -v journalctl >/dev/null 2>&1; then
     kc="$(journalctl -k --since "${AUDIT_HOURS} hours ago" --no-pager 2>/dev/null | grep -Ec 'segfault at .*(php|lsphp|httpd|apache2)')"
   else
     kc="$(dmesg 2>/dev/null | grep -Ec 'segfault at .*(php|lsphp|httpd|apache2)')"
@@ -853,18 +951,22 @@ if [ "$MODE" = audit ]; then
   # 10) Reverse-shell patterns in any running command line
   while read -r pid user args; do
     flag "Reverse-shell-like process $pid ($user): ${args:0:150}"
-  done < <(ps -eo pid=,user=,args= 2>/dev/null | grep -E '/dev/(tcp|udp)/|mkfifo .*(nc|sh)|\bnc(at)? .*-[ec] |(ba)?sh -i|socat .*exec|fsockopen|pty\.spawn' \
+  done < <(ps_all -o pid=,user=,args= 2>/dev/null | grep -E '/dev/(tcp|udp)/|mkfifo .*(nc|sh)|(^|[^[:alnum:]_])nc(at)? .*-[ec] |(ba)?sh -i|socat .*exec|fsockopen|pty\.spawn' \
              | grep -v -e 'grep -E')
 
   # 11) Shells / interpreters running as a web user and detached from their parent (double-forked)
   while read -r pid user comm; do
-    flag "Detached $comm running as $user (pid $pid): $(ps -o args= -p "$pid" 2>/dev/null | cut -c1-150)"
-  done < <(ps -eo pid=,ppid=,user=,comm= 2>/dev/null | awk '
-    $2 == 1 && $3 ~ /^(www-data|apache|nginx|nobody|http|httpd|wwwrun|lsadm)$/ &&
+    flag "Detached $comm running as $user (pid $pid): $(ps_args "$pid")"
+  done < <(ps_all -o pid=,ppid=,user=,comm= 2>/dev/null | awk '
+    $2 == 1 && $3 ~ /^(www-data|www|apache|nginx|nobody|http|httpd|wwwrun|lsadm)$/ &&
     $4 ~ /^(sh|bash|dash|zsh|ksh|nc|ncat|netcat|socat|python[0-9.]*|perl|ruby|php)$/ { print $1, $3, $4 }')
 
   # 12) Network connections owned by shells / interpreters
-  if command -v ss >/dev/null 2>&1; then
+  if [ "$OS" = FreeBSD ] && command -v sockstat >/dev/null 2>&1; then
+    # sockstat -c: connected sockets; columns USER COMMAND PID FD PROTO LOCAL FOREIGN
+    while read -r line; do [ -n "$line" ] && flag "Shell/interpreter with a network connection: ${line:0:200}"; done < <(sockstat -46c -P tcp 2>/dev/null \
+      | awk 'NR>1 && $2 ~ /^(sh|bash|dash|zsh|ksh|nc|ncat|netcat|socat|perl[0-9.]*|python[0-9.]*|ruby[0-9.]*)$/')
+  elif command -v ss >/dev/null 2>&1; then
     while read -r line; do [ -n "$line" ] && flag "Shell/interpreter with a network connection: ${line:0:200}"; done < <(ss -tnpH state established 2>/dev/null \
       | grep -E 'users:\(\("(sh|bash|dash|nc|ncat|netcat|socat|perl|python[0-9.]*|ruby)"')
   fi
@@ -874,11 +976,19 @@ if [ "$MODE" = audit ]; then
     while read -r line; do [ -n "$line" ] && err "PHP container not covered (patch / rebuild its image): $line"; done \
       < <(docker ps --format '{{.Names}} ({{.Image}})' 2>/dev/null | grep -i php)
   fi
+  # 13b) FreeBSD jails with PHP: separate systems, this host run does not look inside them
+  if [ "$OS" = FreeBSD ] && command -v jls >/dev/null 2>&1; then
+    while read -r jid name path; do
+      [ -n "$jid" ] || continue
+      ls "$path"/usr/local/bin/php* "$path"/usr/local/sbin/php-fpm >/dev/null 2>&1 \
+        && err "PHP jail not covered (run php-fix --audit inside it, jexec $name): $name ($path)"
+    done < <(jls jid name path 2>/dev/null)
+  fi
 
   # 14) Per-request INI overrides (context, not a finding): applied before request startup, so any
   #     warning/deprecation they raise is a CVE-2026-109619 consumer. Move them to php.ini / the pool.
   c="$(grep -rlsE '^[^#]*(fastcgi_param|SetEnv|ProxyFCGISetEnvIf|RequestHeader)[^#]*PHP_(ADMIN_)?VALUE' \
-       /etc/nginx /etc/apache2 /etc/httpd /usr/local/lsws/conf 2>/dev/null | head -20)"
+       /etc/nginx /etc/apache2 /etc/httpd /usr/local/lsws/conf /usr/local/etc/nginx /usr/local/etc/apache24 2>/dev/null | head -20)"
   [ -n "$c" ] && info "Web server config passes PHP_VALUE / PHP_ADMIN_VALUE to PHP (keep it free of deprecated / invalid values):" \
     && echo "$c" | while read -r f; do info "  $f"; done
 
@@ -905,16 +1015,16 @@ if [ "$MODE" = revert ]; then
     if [ "$DRY_RUN" -eq 1 ]; then info "[dry-run] Would restore: $orig"; continue; fi
     dir_safe "$orig" || { FAILED=$((FAILED+1)); continue; }
     [ -L "$orig" ] && { err "Refusing to write through symlink: $orig"; FAILED=$((FAILED+1)); continue; }
-    cp -p --no-dereference "$f" "$orig" && { ok "Restored: $orig"; CHANGED=$((CHANGED+1)); } \
+    cp_keep "$f" "$orig" && { ok "Restored: $orig"; CHANGED=$((CHANGED+1)); } \
       || { err "Could not restore: $orig"; FAILED=$((FAILED+1)); }
   done
   while read -r c; do
-    [ -n "$c" ] && grep -q '^; php-fix:' "$c" || continue
+    [ -n "$c" ] && has_mark "$c" || continue
     if [ "$DRY_RUN" -eq 1 ]; then info "[dry-run] Would remove: $c"; continue; fi
     rm -f "$c" && { ok "Removed: $c"; CHANGED=$((CHANGED+1)); }
-  done < <(find ${existing_roots[@]+"${existing_roots[@]}"} -xdev -type f -name "$FEB_INI" 2>/dev/null)
+  done < <(find ${existing_roots[@]+"${existing_roots[@]}"} -xdev -type f \( -name "$FEB_INI" -o -name "$UPL_INI" \) 2>/dev/null)
   for c in "${MODPHP_CONFS[@]}"; do
-    [ -f "$c" ] && grep -q '^# php-fix:' "$c" || continue
+    [ -f "$c" ] && has_mark "$c" || continue
     if [ "$DRY_RUN" -eq 1 ]; then info "[dry-run] Would remove: $c"; continue; fi
     case "$c" in /etc/apache2/conf-available/*) command -v a2disconf >/dev/null && a2disconf -q zz-php2shell >/dev/null 2>&1 ;; esac
     rm -f "$c" && { ok "Removed: $c"; CHANGED=$((CHANGED+1)); }
@@ -938,14 +1048,47 @@ mapfile -t INI_FILES < <(
   } | grep -v '(none)' | while read -r f; do [ -f "$f" ] && readlink -f "$f"; done | sort -u
 )
 
-if [ ${#INI_FILES[@]} -eq 0 ]; then
+# 1a) PHP binaries that load no php.ini. Common on FreeBSD, where pkg installs only
+#     php.ini-production / php.ini-development. Write a php-fix drop-in into the binary's
+#     own scan dir (/usr/local/etc/php/ on FreeBSD) instead; --revert removes it.
+loaded_ini() {
+  if [ "$2" = cli ]; then "$1" --ini 2>/dev/null | awk -F': *' '/^Loaded Configuration File/ {print $2; exit}'
+  else "$1" -i 2>/dev/null | awk -F' => ' '$1=="Loaded Configuration File" {print $2; exit}'; fi
+}
+NOINI=()
+while IFS='|' read -r b sapi ver v; do
+  [ "$(loaded_ini "$b" "$sapi")" = "(none)" ] && NOINI+=("$b|$sapi")
+done < <(collect_bins)
+
+if [ ${#INI_FILES[@]} -eq 0 ] && [ ${#NOINI[@]} -eq 0 ]; then
   err "No php.ini found."
   exit 1
 fi
 
-info "Found ${#INI_FILES[@]} php.ini file(s)."
+[ ${#INI_FILES[@]} -gt 0 ] && info "Found ${#INI_FILES[@]} php.ini file(s)."
 
-for f in "${INI_FILES[@]}"; do
+UPL_BODY="$INI_MARK
+; php-fix drop-in: this PHP loads no php.ini. --revert removes it.
+${DIRECTIVE} = Off"
+UPL_SEEN=" "
+for e in ${NOINI[@]+"${NOINI[@]}"}; do
+  b="${e%|*}"; sapi="${e#*|}"
+  d="$(scan_dir "$b" "$sapi")"
+  if [ -z "$d" ]; then
+    err "$b ($sapi) loads no php.ini and has no conf.d: create a php.ini with ${DIRECTIVE} = Off"; FAILED=$((FAILED+1)); continue
+  fi
+  case "$UPL_SEEN" in *" $d "*) continue ;; esac     # CLI and FPM often share it
+  UPL_SEEN="$UPL_SEEN$d "
+  f="$d/$UPL_INI"
+  if [ -f "$f" ] && has_mark "$f"; then ok "Already Off (php-fix drop-in): $f"; SKIPPED=$((SKIPPED+1)); continue; fi
+  if [ "$DRY_RUN" -eq 1 ]; then info "[dry-run] $b ($sapi) loads no php.ini: would write ${DIRECTIVE} = Off to $f"; continue; fi
+  if [ -e "$f" ] || [ -L "$f" ] || ! dir_safe "$f"; then err "Refusing to write: $f"; FAILED=$((FAILED+1)); continue; fi
+  printf '%s\n' "$UPL_BODY" > "$f" \
+    && { ok "No php.ini loaded by $b ($sapi): wrote ${DIRECTIVE} = Off to $f"; CHANGED=$((CHANGED+1)); } \
+    || { err "Could not write: $f"; FAILED=$((FAILED+1)); }
+done
+
+for f in ${INI_FILES[@]+"${INI_FILES[@]}"}; do
   active_lines="$(grep -Ei "$ACTIVE_RE" "$f" || true)"
   if [ -n "$active_lines" ] && ! echo "$active_lines" | grep -Eivq "$OFF_RE"; then
     ok "Already Off: $f"; SKIPPED=$((SKIPPED+1)); continue
@@ -959,13 +1102,14 @@ for f in "${INI_FILES[@]}"; do
 
   if grep -Eiq "$ANY_RE" "$f"; then
     # Replace existing (commented or active) line
-    sed -i -E "s/${ANY_RE}.*/${DIRECTIVE} = Off/I" "$f"
+    edit_i "$f" sed -E "s/${ANY_RE}.*/${DIRECTIVE} = Off/I"
   elif grep -q '^\[Session\]' "$f"; then
-    # Insert right below the [Session] section header
-    sed -i "/^\[Session\]/a ${DIRECTIVE} = Off" "$f"
+    # Insert right below the [Session] section header (awk: GNU and BSD sed disagree on one-line `a`)
+    edit_i "$f" awk -v line="${DIRECTIVE} = Off" '{ print } /^\[Session\]/ { print line }'
   else
     printf '\n[Session]\n%s = Off\n' "$DIRECTIVE" >> "$f"
   fi
+  mark_i "$f" "${DIRECTIVE} = Off" || err "Could not add the comment to: $f"
 
   if grep -Eiq "$OFF_RE" "$f"; then
     ok "Updated: $f  (backup: $f.bak-$TS)"; CHANGED=$((CHANGED+1))
@@ -981,7 +1125,7 @@ if [ ${#existing_roots[@]} -gt 0 ]; then
   for f in ${EXTRA_INI[@]+"${EXTRA_INI[@]}"}; do
     if ! grep -Ei "$ACTIVE_RE" "$f" | grep -Eivq "$OFF_RE"; then continue; fi
     if [ "$DRY_RUN" -eq 1 ]; then info "[dry-run] Would fix override: $f"; continue; fi
-    backup "$f" && sed -i -E "s/${ACTIVE_RE}.*/${DIRECTIVE} = Off/I" "$f" \
+    backup "$f" && edit_i "$f" sed -E "s/${ACTIVE_RE}.*/${DIRECTIVE} = Off/I" && mark_i "$f" "${DIRECTIVE} = Off" \
       && { ok "Fixed override: $f  (backup: $f.bak-$TS)"; CHANGED=$((CHANGED+1)); } \
       || { err "Could not fix override: $f"; FAILED=$((FAILED+1)); }
   done
@@ -995,7 +1139,8 @@ if [ ${#existing_roots[@]} -gt 0 ]; then
       continue  # already php_admin_flag ... = off
     fi
     if [ "$DRY_RUN" -eq 1 ]; then info "[dry-run] Would fix FPM pool: $f"; continue; fi
-    backup "$f" && sed -i -E "s/^([[:space:]]*)(${POOL_RE})[[:space:]]*=.*/\1php_admin_flag[${DIRECTIVE}] = off/" "$f" \
+    backup "$f" && edit_i "$f" sed -E "s/^([[:space:]]*)(${POOL_RE})[[:space:]]*=.*/\1php_admin_flag[${DIRECTIVE}] = off/" \
+      && mark_i "$f" "php_admin_flag[${DIRECTIVE}] = off" \
       && { ok "Fixed FPM pool: $f  (backup: $f.bak-$TS)"; CHANGED=$((CHANGED+1)); } \
       || { err "Could not fix FPM pool: $f"; FAILED=$((FAILED+1)); }
   done
@@ -1003,10 +1148,10 @@ if [ ${#existing_roots[@]} -gt 0 ]; then
   # 3b) Pools with no setting at all: add php_admin_flag, otherwise a .user.ini (or a pool
   #     php_value added later) can turn it back on over php.ini. Guarded by `php-fpm -t`.
   mapfile -t BARE_POOLS < <(find "${existing_roots[@]}" -xdev -type f -name '*.conf' -print0 2>/dev/null \
-    | xargs -0 -r grep -lE '^[[:space:]]*listen[[:space:]]*=' 2>/dev/null \
-    | xargs -d '\n' -r grep -lE '^[[:space:]]*pm[[:space:]]*=' 2>/dev/null \
-    | xargs -d '\n' -r grep -lE '^[[:space:]]*\[[^]]+\][[:space:]]*$' 2>/dev/null \
-    | xargs -d '\n' -r grep -LE "^[[:space:]]*${POOL_RE}" 2>/dev/null | sort -u)
+    | xargs -0 -r grep -lE '^[[:space:]]*listen[[:space:]]*=' 2>/dev/null | nl2nul \
+    | xargs -0 -r grep -lE '^[[:space:]]*pm[[:space:]]*=' 2>/dev/null | nl2nul \
+    | xargs -0 -r grep -lE '^[[:space:]]*\[[^]]+\][[:space:]]*$' 2>/dev/null | nl2nul \
+    | xargs -0 -r grep -LE "^[[:space:]]*${POOL_RE}" 2>/dev/null | sort -u)
   if [ ${#BARE_POOLS[@]} -gt 0 ]; then
     FPM_OK_BEFORE=()
     while read -r b; do [ -n "$b" ] && "$b" -t >/dev/null 2>&1 && FPM_OK_BEFORE+=("$b"); done < <(find_fpm_bins)
@@ -1015,8 +1160,8 @@ if [ ${#existing_roots[@]} -gt 0 ]; then
       if [ "$DRY_RUN" -eq 1 ]; then info "[dry-run] Would add php_admin_flag to FPM pool(s) in: $f"; continue; fi
       tmp="$(mktemp)"
       # after every [pool] header except [global]
-      awk -v line="php_admin_flag[${DIRECTIVE}] = off" \
-        '{ print } /^[[:space:]]*\[[^]]+\][[:space:]]*$/ && !/^[[:space:]]*\[global\]/ { print line }' "$f" > "$tmp"
+      awk -v line="php_admin_flag[${DIRECTIVE}] = off" -v c="$INI_MARK" \
+        '{ print } /^[[:space:]]*\[.+\][[:space:]]*$/ && !/^[[:space:]]*\[global\]/ { print c; print line }' "$f" > "$tmp"
       grep -qF "php_admin_flag[${DIRECTIVE}]" "$tmp" || { rm -f "$tmp"; continue; }   # only [global] here
       backup "$f" || { err "Backup failed: $f"; FAILED=$((FAILED+1)); rm -f "$tmp"; continue; }
       cat "$tmp" > "$f" && HARDENED+=("$f") \
@@ -1028,7 +1173,7 @@ if [ ${#existing_roots[@]} -gt 0 ]; then
       [ ${#HARDENED[@]} -gt 0 ] || break
       if ! "$b" -t >/dev/null 2>&1; then
         err "$b -t fails after locking pools: restoring them, FPM config left as it was"
-        for f in "${HARDENED[@]}"; do cp -p "$f.bak-$TS" "$f"; done
+        for f in "${HARDENED[@]}"; do cp_keep "$f.bak-$TS" "$f"; done
         FAILED=$((FAILED+1)); HARDENED=(); break
       fi
     done
@@ -1046,12 +1191,14 @@ if [ -n "$APACHECTL" ] && { "$APACHECTL" -M 2>/dev/null | grep -Eiq '^[[:space:]
     MODPHP_CONF="${MODPHP_CONFS[1]}"     # RHEL family
   elif [ -d /etc/apache2/conf.d ]; then
     MODPHP_CONF="${MODPHP_CONFS[2]}"     # cPanel EA4
+  elif [ -d /usr/local/etc/apache24/Includes ]; then
+    MODPHP_CONF="${MODPHP_CONFS[3]}"     # FreeBSD (httpd.conf includes Includes/*.conf)
   else
     err "mod_php detected but no Apache conf.d directory found; add php_admin_flag ${DIRECTIVE} off manually"
   fi
 fi
 if [ -n "$MODPHP_CONF" ]; then
-  MODPHP_BODY="# php-fix: php2shell (CVE-2026-109618 / CVE-2026-109619) mitigation
+  MODPHP_BODY="$APACHE_MARK
 # php_admin_flag cannot be overridden from .htaccess
 <IfModule php_module>
     php_admin_flag ${DIRECTIVE} off
@@ -1085,13 +1232,14 @@ fi
 
 # 4b) Unpatched PHP 8.5: fatal_error_backtraces = Off, as a php-fix drop-in in the
 #     binary's own conf.d (php.ini untouched; --revert removes it)
-FEB_BODY="; php-fix: php2shell (CVE-2026-109619) mitigation for unpatched PHP 8.5; delete after patching
+FEB_BODY="$INI_MARK
+; php-fix drop-in for unpatched PHP 8.5 (CVE-2026-109619); delete after patching. --revert removes it.
 ${FEB} = Off"
 while IFS='|' read -r b sapi ver v; do
   [ "$(branch_num "$ver")" = 805 ] || continue
   classify "$ver" "" "$b"; [ "$STATUS" = PATCHED ] && continue
   d="$(scan_dir "$b" "$sapi")"
-  [ -n "$d" ] && [ -f "$d/$FEB_INI" ] && grep -q '^; php-fix:' "$d/$FEB_INI" && continue   # already written
+  [ -n "$d" ] && [ -f "$d/$FEB_INI" ] && has_mark "$d/$FEB_INI" && continue   # already written
   is_off "$(ini_val "$b" "$sapi" "$FEB")" && continue
   if [ -z "$d" ]; then
     err "$b: no conf.d directory; set ${FEB} = Off in its php.ini yourself"; FAILED=$((FAILED+1)); continue
@@ -1099,8 +1247,8 @@ while IFS='|' read -r b sapi ver v; do
   f="$d/$FEB_INI"
   if [ "$DRY_RUN" -eq 1 ]; then info "[dry-run] Would write ${FEB} = Off: $f"; continue; fi
   if [ -e "$f" ] || [ -L "$f" ] || ! dir_safe "$f"; then err "Refusing to write: $f"; FAILED=$((FAILED+1)); continue; fi
-  printf '%s
-' "$FEB_BODY" > "$f" && { ok "Wrote ${FEB} = Off (PHP 8.5): $f"; CHANGED=$((CHANGED+1)); }     || { err "Could not write: $f"; FAILED=$((FAILED+1)); }
+  printf '%s\n' "$FEB_BODY" > "$f" && { ok "Wrote ${FEB} = Off (PHP 8.5): $f"; CHANGED=$((CHANGED+1)); } \
+    || { err "Could not write: $f"; FAILED=$((FAILED+1)); }
 done < <(collect_bins)
 
 # 5) Reload services
@@ -1152,6 +1300,9 @@ fi
 
 echo
 echo "Changed: $CHANGED | Already Off: $SKIPPED | Errors: $FAILED"
+if [ "$OS" = FreeBSD ] && command -v jls >/dev/null 2>&1 && [ -n "$(jls jid 2>/dev/null)" ]; then
+  info "Jails are separate systems: run php-fix inside every jail that runs PHP (jexec <jail> bash ...)."
+fi
 if [ "$DRY_RUN" -eq 1 ]; then
   info "Dry run finished, nothing was changed."
   [ "$LEGACY" -eq 1 ] && exit 2
