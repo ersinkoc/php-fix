@@ -234,7 +234,9 @@ rm -f "$ALOG"
 echo "== --audit: published indicators in rotated logs, session-file webshell, exposure window"
 # rotated + gzipped log with a php://filter read-back from a published IOC address and a scanner UA (inert text)
 printf '%s\n' '221.14.159.134 - - [21/Oct/2026:17:23:00 +0000] "GET /download.php?file=php://filter/convert.base64-encode/resource=/var/lib/php/sessions/sess_x HTTP/1.1" 404 0 "-" "-"' \
-  '198.51.100.20 - - [21/Oct/2026:17:30:00 +0000] "POST /index.php HTTP/1.1" 200 5 "-" "php2shell-scan/109618"' | gzip > "$ALOG.2.gz"
+  '198.51.100.20 - - [21/Oct/2026:17:30:00 +0000] "POST /index.php HTTP/1.1" 200 5 "-" "php2shell-scan/109618"' \
+  '198.51.100.21 - - [21/Oct/2026:18:16:00 +0000] "POST / HTTP/1.1" 200 5 "-" "B8RAT/1.0"' \
+  '94.154.43.7 - - [21/Oct/2026:16:21:09 +0000] "POST / HTTP/1.1" 500 0 "-" "-" ct="multipart/form-data; boundary=----p2shell0123456789abcdef01234567"' | gzip > "$ALOG.2.gz"
 cat > /tmp/sess_phpfixtest <<'SESS'
 x|s:44:"<?php echo 'PWNED::'; system($_GET['c']); ?>";
 SESS
@@ -243,6 +245,9 @@ expect_rc 3 "$rc" "audit flags published indicators"
 echo "$out" | grep -q 'IOC addresses .*221\.14\.159\.134 (1)' && pass "audit flags an IOC address in a rotated .gz log" || fail "audit missed IOC address in rotated log"
 echo "$out" | grep -q 'php://filter in request URLs .*221\.14\.159\.134' && pass "audit flags php://filter read-back" || fail "audit missed php://filter"
 echo "$out" | grep -q 'scanner user agents .*198\.51\.100\.20 (1)' && pass "audit reports php2shell scanner UA" || fail "audit missed scanner UA"
+echo "$out" | grep 'php2shell attack tool' | grep -q '198\.51\.100\.21 (1)' && echo "$out" | grep 'php2shell attack tool' | grep -q '94\.154\.43\.7 (1)' \
+  && pass "audit flags the B8RAT UA and the p2shell boundary (OffSeq)" || fail "audit missed B8RAT / p2shell boundary"
+echo "$out" | grep -q 'IOC addresses .*94\.154\.43\.7 (1)' && pass "audit knows the OffSeq IOC addresses" || fail "audit missed OffSeq IOC address"
 echo "$out" | grep -q 'Session file holds PHP code .*/tmp/sess_phpfixtest' && pass "audit flags a session-file webshell" || fail "audit missed session-file webshell"
 echo "$out" | grep -q 'audit=exposure covers' && pass "48 h audit points to --audit=exposure" || fail "no exposure hint"
 bash $S --audit=exposure 2>&1 | grep -qE 'audit, last [0-9]+h' && pass "--audit=exposure computes the window" || fail "--audit=exposure"
@@ -361,6 +366,14 @@ $bad  = ["PHPSESSID=%00%01%02secret%3Dhunter2; path=/", "PHPSESSID=" . str_repea
 foreach ($good as $c) if (!preg_match($re, $c)) { echo "false positive: $c\n"; exit(1); }
 foreach ($bad as $c)  if (preg_match($re, $c))  { echo "missed: $c\n"; exit(1); }' \
   && pass "PHPSESSID rule passes real IDs / logout, catches leaks" || fail "PHPSESSID rule regex"
+re="$(bash $S --waf-print | grep -A1 '^SecRule ARGS_NAMES "@rx (?:' | head -1 | sed -n 's/^SecRule ARGS_NAMES "@rx \(.*\)" \\$/\1/p')"
+[ -n "$re" ] && RE="$re" php -r '
+$re = "/" . str_replace("/", "\\/", getenv("RE")) . "/";
+$deep = "f0"; for ($i = 0; $i < 60; $i++) $deep .= "[k$i]";
+$ok = ["user[address][street]", "items[0][options][color][]", "a[b][c][d][e][f][g][h][i][j]"];
+foreach ($ok as $n) if (preg_match($re, $n)) { echo "false positive: $n\n"; exit(1); }
+exit(preg_match($re, $deep) ? 0 : 1);' && pass "nesting rule blocks f0[k0]..[k59], passes normal forms" || fail "nesting rule regex"
+bash $S --waf-print | grep -q '^SecRule REQUEST_HEADERS:User-Agent "@rx ^B8RAT/"' && pass "waf-print has the B8RAT rule" || fail "waf-print missing B8RAT rule"
 
 echo "== --check: Imunify360 WAF ruleset version"
 IMV=/etc/apache2/conf.d/modsec_vendor_configs/imunify360-full-apache

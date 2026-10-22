@@ -20,7 +20,7 @@
 
 set -u
 
-VERSION="1.17.0"
+VERSION="1.18.0"
 DIRECTIVE="session.upload_progress.enabled"
 TS="$(date +%Y%m%d-%H%M%S)"
 MODE=fix
@@ -49,9 +49,11 @@ CPANEL_FIXED="${PHPFIX_CPANEL_FIXED:-74:19 80:12 81:5}"
 # Earliest exploitation attempt seen (Amazon MadPot honeypot, 17 Oct 2026, four days before disclosure).
 FIRST_SEEN="2026-10-17T00:00:00Z"
 # Published indicators. Shared hosting / anonymization addresses, not exclusive to this activity:
-# investigate hits, don't treat them as proof. Amazon Threat Intelligence + VulnCheck (21 Oct 2026).
+# investigate hits, don't treat them as proof. Amazon Threat Intelligence + VulnCheck (21 Oct 2026),
+# OffSeq Mirage honeypots (first 48 h, 18-22 Oct).
 IOC_IPS="103.216.220.92 31.223.184.166 37.19.200.5 134.209.159.64 103.114.163.188 95.217.98.37
-  85.11.167.243 45.198.224.169 109.71.252.97 221.14.159.134 91.90.123.25"
+  85.11.167.243 45.198.224.169 109.71.252.97 221.14.159.134 91.90.123.25
+  94.154.43.7 38.180.45.91 80.66.66.66 217.60.242.76 87.192.237.19 34.19.34.88 34.76.232.95 34.76.218.47 194.42.196.44"
 
 usage() {
   cat <<EOF
@@ -152,6 +154,16 @@ SecRule ARGS_NAMES "@streq PHP_SESSION_UPLOAD_PROGRESS" \
 SecRule REQUEST_HEADERS:Content-Type "@rx (?i)multipart" \
   "id:1026110,phase:1,deny,status:403,log,msg:'php2shell multipart outside allowlist',chain"
   SecRule REQUEST_FILENAME "!@rx ^/(wp-admin/async-upload\.php|wp-admin/media-new\.php)$" ""
+
+############ ModSecurity — known php2shell tools and shapes (OffSeq honeypots, 21-22 Oct) ############
+# Tools change their tags: a filter, not protection. The nesting rule needs body access (phase 2):
+# the lead tool sends f0[k0][k1]...[k59], up to ~580 bracket pairs; real forms stay far below 20.
+SecRule REQUEST_HEADERS:Content-Type "@rx (?i)boundary=-*p2shell" \
+  "id:1026115,phase:1,deny,status:403,log,msg:'php2shell tool boundary'"
+SecRule REQUEST_HEADERS:User-Agent "@rx ^B8RAT/" \
+  "id:1026116,phase:1,deny,status:403,log,msg:'php2shell B8RAT tool'"
+SecRule ARGS_NAMES "@rx (?:\[[^\]]*\]){20,}" \
+  "id:1026114,phase:2,deny,status:403,log,t:none,msg:'php2shell deeply nested parameter name'"
 
 ############ ModSecurity — urlencoded OOM shape (CVE-2026-109618, Datadog) ############
 # The OOM path also works WITHOUT multipart: one ~3.5 MB urlencoded field NAME, an empty-named
@@ -1040,18 +1052,20 @@ if [ "$MODE" = audit ]; then
           if (l ~ /php:(\/\/|%2f%2f)filter/)              print "filter", $1
           if (l ~ /php_session_upload_progress/)          print "upf", $1
           if (l ~ /php2shell-(scan|verify|poc)|\(php2shell-poc\)/) print "ua", $1
+          if (l ~ /"b8rat\/[0-9]/ || l ~ /boundary=-*p2shell[0-9a-f]/) print "tool", $1
           if (l ~ /\/php2shell-probe-/)                   print "probe", $1 }')"
     hits() { printf '%s\n' "$IOC_HITS" | awk -v t="$1" '$1 == t {c[$2]++} END {for (k in c) printf "%s%s (%d)", (n++ ? ", " : ""), k, c[k]}'; }
     info "Searched ${#ALL_LOGS[@]} access log(s) of the window, rotated ones included, for published php2shell indicators."
     h="$(hits ip)";     [ -n "$h" ] && flag "Requests from published php2shell IOC addresses (shared infrastructure, investigate): $h"
     h="$(hits filter)"; [ -n "$h" ] && flag "php://filter in request URLs (read-back of a planted session file / LFI?) from: $h"
     h="$(hits upf)";    [ -n "$h" ] && flag "PHP_SESSION_UPLOAD_PROGRESS in request URLs from: $h"
+    h="$(hits tool)";   [ -n "$h" ] && flag "php2shell attack tool (B8RAT user agent / p2shell multipart boundary, OffSeq) from: $h"
     h="$(hits ua)";     [ -n "$h" ] && info "php2shell scanner user agents (probing, maybe your own checks) from: $h"
     h="$(hits probe)";  [ -n "$h" ] && info "php2shell-probe-* file requests (probing) from: $h"
   fi
 
   # 8) PHP worker crashes: memory-corruption exploits usually crash workers while they are being tuned
-  CRASH_RE='exited on signal (6|7|11)|SIGSEGV|SIGBUS|Segmentation fault|exit signal Aborted'
+  CRASH_RE='exited on signal (6|7|11)|SIGSEGV|SIGBUS|Segmentation fault|exit signal Aborted|zend_mm_heap corrupted'
   for l in /var/log/php*-fpm.log /var/log/php-fpm/*log /opt/cpanel/ea-php*/root/usr/var/log/php-fpm.log \
            /opt/remi/php*/root/var/log/php-fpm/*log /opt/plesk/php/*/var/log/php-fpm.log \
            /www/server/php/*/var/log/php-fpm.log /var/log/apache2/error*.log /var/log/httpd/error_log \

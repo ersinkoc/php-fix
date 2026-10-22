@@ -48,7 +48,7 @@ curl -fsSL https://raw.githubusercontent.com/ersinkoc/php-fix/main/install.sh | 
 Piping `main` into `sudo bash` means trusting whatever is on `main` at that moment. For production, use a release instead. Every release is built by GitHub Actions and ships with a `SHA256SUMS` file and a signed [build provenance attestation](https://docs.github.com/actions/security-for-github-actions/using-artifact-attestations):
 
 ```bash
-V=v1.17.0
+V=v1.18.0
 curl -fsSLO https://github.com/ersinkoc/php-fix/releases/download/$V/install.sh
 curl -fsSLO https://github.com/ersinkoc/php-fix/releases/download/$V/SHA256SUMS
 sha256sum -c SHA256SUMS                                      # integrity
@@ -156,7 +156,7 @@ If `ps` or `ss` is missing (e.g. minimal container images), the audit says which
 
 ## Published indicators (IOCs)
 
-From [Amazon Threat Intelligence](https://aws.amazon.com/blogs/security/amazon-threat-intelligence-identifies-php2shell-exploitation-prior-to-public-disclosure-in-madpot/) and [VulnCheck](https://www.vulncheck.com/blog/php2shell-vulnerabilities) (21 October 2026). `--audit` searches access logs for them. The addresses belong to anonymization and hosting networks that other people use too, and they rotate within days. **Investigate hits; don't treat them as proof, and don't rely on blocking them.**
+From [Amazon Threat Intelligence](https://aws.amazon.com/blogs/security/amazon-threat-intelligence-identifies-php2shell-exploitation-prior-to-public-disclosure-in-madpot/), [VulnCheck](https://www.vulncheck.com/blog/php2shell-vulnerabilities) (21 October 2026) and [OffSeq](https://offseq.com/en/research/php2shell-first-48-hours/) (22 October, also collected in [SOCNova's advisory](https://www.socnova.com/tr/php-detection.html) with JA4H fingerprints `po10nn060000_efc8bc7e3e52_000000000000` and `po10nn150000_94b423c72d17_000000000000`). `--audit` searches access logs for them. The addresses belong to anonymization and hosting networks that other people use too, and they rotate within days. **Investigate hits; don't treat them as proof, and don't rely on blocking them.**
 
 | Indicator | Meaning |
 |---|---|
@@ -164,7 +164,14 @@ From [Amazon Threat Intelligence](https://aws.amazon.com/blogs/security/amazon-t
 | `31.223.184.166`, `37.19.200.5`, `134.209.159.64`, `103.114.163.188`, `95.217.98.37` | Attempts on 21 Oct (Amazon) |
 | `85.11.167.243`, `45.198.224.169`, `109.71.252.97`, `91.90.123.25` | Multipart probing of `/index.php` and `/`, 21 Oct (VulnCheck) |
 | `221.14.159.134` | Exploitation attempt, 21 Oct 17:22 UTC: webshell planted into a session file, then read back. A residential ISP address, so follow it up first (VulnCheck) |
-| `PHP_SESSION_UPLOAD_PROGRESS` field in a multipart body | The upload-progress path. Needs body logging or a WAF to see it |
+| `94.154.43.7` | Lead actor on [OffSeq's honeypots](https://offseq.com/en/research/php2shell-first-48-hours/): 269 requests in a two-minute size sweep, 21 Oct 16:21 UTC, again 22 Oct 02:30. No user agent, `Transfer-Encoding: chunked` |
+| `38.180.45.91` (`B8RAT/1.0`), `80.66.66.66`, `217.60.242.76`, `87.192.237.19` (manual `curl`) | Other upload-progress dialects, 21–22 Oct (OffSeq) |
+| `34.19.34.88`, `34.76.232.95`, `34.76.218.47` (Google Cloud, `fasthttp`), `194.42.196.44` | Memory-pressure bodies: 1 MB `wafjunk` field of `A`s from 20 Oct 21:57 UTC, and a 2 MB WordPress REST batch on 18 Oct (OffSeq) |
+| Boundary `----p2shell<24 hex>`, user agent `B8RAT/1.0` | Attack tools tagging themselves. `--audit` flags them in access logs (the boundary only if `Content-Type` is logged), `--waf-print` blocks them |
+| Field names `f0[k0][k1]…[k59]` … `f9[…]`, up to ~580 bracket pairs; upload-progress value `\|x\|i:1;` | Request shapes of the lead tool and the serialized-data variant. `--waf-print` blocks names nested 20+ levels deep |
+| A size sweep: upload-progress POSTs from one source with growing bodies | An attacker tuning the out-of-memory point. Log the request length (`$request_length` / `%I`) to see it |
+| `PHP_SESSION_UPLOAD_PROGRESS` field in a multipart body | The upload-progress path. Needs body logging or a WAF to see it. OffSeq saw it **zero** times in the six weeks before 20 Oct, so on most sites any hit is an attack |
+| `zend_mm_heap corrupted` in PHP / FPM logs | Heap corruption, next to `SIGSEGV`. `--audit` counts it as a worker crash |
 | `GET /download.php?file=php://filter/...` | Attempt to include the planted session file |
 | Session file `sess_xqsuvwz3n97wu8j3emz1axuo5y`, boundary `------p2s9rdme2st6guc9g0rafic`, file name `p2s.txt` | That attempt's artifacts |
 | `<?php echo 'PWNED::'; system($_GET['c']); ?>`, `PWNED::` in a response | The planted payload; `PWNED::` in a response means code ran |
@@ -218,7 +225,7 @@ The tests cover:
   - `--audit` flags a web-user process running a deleted binary and reports `Failed to decode session object` lines. The PHPSESSID disclosure rule from `--waf-print` is checked against real IDs (32 hex, 26-char base32, `deleted`) and against URL-encoded and overlong leaks
   - `--audit` flags a planted webshell, a worker `SIGSEGV` log line, a request-startup OOM (`in Unknown on line 0`, while an ordinary in-script OOM is ignored), a PHP file in `/tmp`, a reverse-shell command line, and a multipart request answered with `502` in a `Content-Type`-logging access log
   - `--audit` flags an image polyglot (`GIF89a<?php`) and an `avatar.php.jpg`, and leaves a clean image alone
-  - `--audit` finds a published IOC address and a `php://filter` read-back in a **rotated, gzipped** access log, reports a `php2shell-scan` user agent, and flags a session file carrying a `PWNED::` webshell. `--audit=exposure` computes the window back to 17 Oct
+  - `--audit` finds a published IOC address (OffSeq's too) and a `php://filter` read-back in a **rotated, gzipped** access log, flags the `B8RAT` user agent and a `p2shell` boundary, reports a `php2shell-scan` user agent, and flags a session file carrying a `PWNED::` webshell. `--audit=exposure` computes the window back to 17 Oct
   - `--audit` output stays clean when file names carry terminal escapes (ESC, 8-bit and UTF-8 C1)
   - `--check` runs; the EOL warning and the `< 5.4` exit `2` path are tested with stub binaries
 
