@@ -223,6 +223,14 @@ echo "NOTICE: PHP message: PHP Fatal error:  Allowed memory size of 16777216 byt
 echo "NOTICE: PHP message: PHP Fatal error:  Allowed memory size of 16777216 bytes exhausted (tried to allocate 20480 bytes) in /var/www/html/x.php on line 3" >> /var/log/phptest-fpm.log
 out2="$(bash $S --audit 2>&1)"
 echo "$out2" | grep -q '1 request-startup out-of-memory line(s)' && pass "audit flags request-startup OOM (only 'Unknown on line 0')" || fail "audit missed request-startup OOM"
+echo "NOTICE: PHP message: PHP Fatal error:  Hard memory limit of 268435456 bytes exhausted (tried to allocate 505413632 bytes) in /var/www/html/x.php on line 2" >> /var/log/phptest-fpm.log
+echo "WARNING: [pool www] child 4243 said into stderr: \"zend_mm_heap corrupted\"" >> /var/log/phptest-fpm.log
+out3="$(bash $S --audit 2>&1)"
+echo "$out3" | grep -q '1 hard memory limit kill(s) (exit 137)' && pass "audit reports hard memory limit kills" || fail "audit missed hard memory limit kill"
+case "$(php -v | awk 'NR==1{print $2}')" in
+  8.4.27*|8.5.12*) echo "$out3" | grep -q "\[\.\.\] 1 'zend_mm_heap corrupted' line(s) .*php-src#24488" && pass "heap corruption on 8.4.27 / 8.5.12 points to the SimpleXML regression" || fail "heap corruption regression note missing" ;;
+  *) echo "$out3" | grep -q "1 'zend_mm_heap corrupted' line(s) in /var/log/phptest-fpm.log (heap corruption" && pass "audit flags heap corruption" || fail "audit missed heap corruption" ;;
+esac
 echo "$out" | grep -q 'PHP file in a temp directory: /tmp/dropper.php' && pass "audit flags temp-dir PHP" || fail "audit missed temp-dir PHP"
 echo "$out" | grep -q 'Reverse-shell-like process' && pass "audit flags reverse-shell command line" || fail "audit missed reverse shell"
 kill "$RS" 2>/dev/null; pkill -f '203.0.113.7' 2>/dev/null; rm -f /var/log/phptest-fpm.log /tmp/dropper.php
@@ -384,6 +392,17 @@ bash $S --check 2>&1 | grep -q 'Imunify360 WAF rules 8.83: 8.84+' && pass "Imuni
 echo 8.85 > "$IMV/VERSION"
 bash $S --check 2>&1 | grep -q 'Imunify360 WAF rules 8.85 (>= 8.85' && pass "Imunify360 8.85 recognised" || fail "Imunify360 8.85 not recognised"
 rm -rf /etc/apache2/conf.d/modsec_vendor_configs; rmdir /etc/apache2/conf.d /etc/apache2 2>/dev/null
+
+echo "== --check: LiteSpeed WebAdmin's own PHP"
+mkdir -p /usr/local/lsws/admin/fcgi-bin /usr/local/lsws/admin/conf
+printf '#!/bin/sh\necho "PHP 5.6.40 (litespeed) (built: Jan 10 2019 00:00:00)"\n' > /usr/local/lsws/admin/fcgi-bin/admin_php5
+chmod 755 /usr/local/lsws/admin/fcgi-bin/admin_php5; ln -s admin_php5 /usr/local/lsws/admin/fcgi-bin/admin_php
+printf 'listener adminListener {\n  address *:7080\n  secure 1\n}\n' > /usr/local/lsws/admin/conf/admin_config.conf
+out="$(bash $S --check 2>&1)"
+[ "$(echo "$out" | grep -c 'admin_php5 (lsws-admin 5.6.40): EOL.*listens on \*:7080: firewall')" = 1 ] && pass "--check flags a public WebAdmin running old PHP (once)" || fail "WebAdmin PHP not flagged"
+sed -i 's/\*:7080/127.0.0.1:7080/' /usr/local/lsws/admin/conf/admin_config.conf
+bash $S --check 2>&1 | grep -q 'listens on 127.0.0.1:7080 only' && pass "--check notes a localhost-only WebAdmin" || fail "localhost WebAdmin not recognised"
+rm -rf /usr/local/lsws
 
 if [ "$MODPHP" = 1 ] && grep -qs LoadModule /etc/apache2/mods-enabled/php*.load; then
   echo "== --check: mod_php risk note"

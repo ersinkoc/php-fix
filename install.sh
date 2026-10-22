@@ -20,7 +20,7 @@
 
 set -u
 
-VERSION="1.18.0"
+VERSION="1.19.0"
 DIRECTIVE="session.upload_progress.enabled"
 TS="$(date +%Y%m%d-%H%M%S)"
 MODE=fix
@@ -758,6 +758,10 @@ if [ "$MODE" = check ]; then
     if [ "$(branch_num "$ver")" = 805 ] && [ "$STATUS" != PATCHED ]; then
       is_off "$(ini_val "$b" "$sapi" "$FEB")" && NOTE="$NOTE ${FEB} Off." || NOTE="$NOTE ${FEB} is On (confirmed RCE producer): run the fix."
     fi
+    case "$ver" in 8.4.27*|8.5.12*) [ "$STATUS" = PATCHED ] && NOTE="$NOTE Known $ver regression: SimpleXML objects in GC cycles crash workers ('zend_mm_heap corrupted', php-src#24488): take the next release." ;; esac
+    if [ "$STATUS" != PATCHED ] && "$b" -m 2>/dev/null | grep -qix hp_uploadprogress_guard; then
+      NOTE="$NOTE hp_uploadprogress_guard is loaded (third-party stopgap, not reviewed by PHP): still update PHP."
+    fi
     report "$sapi" "$b" "$ver" "$STATUS" "$MIT" "$NOTE"
     [ "$STATUS" = PATCHED ] || UNPATCHED=1
   done < <(collect_bins)
@@ -803,6 +807,22 @@ if [ "$MODE" = check ]; then
     if [ -n "$iv" ] && ver_ge "$iv" 8.85; then ok "Imunify360 WAF rules $iv (>= 8.85, php2shell rules; interim only, none for the OOM path): $f"
     elif [ -n "$iv" ] && ver_ge "$iv" 8.83; then info "Imunify360 WAF rules $iv: 8.84+ also blocks the tool on LiteSpeed, 8.85 more variants: imunify360-agent update --force modsec-rules"
     else err "Imunify360 WAF rules ${iv:-unknown} are older than 8.83: imunify360-agent update --force modsec-rules"; fi
+  done
+
+  # OpenLiteSpeed / LiteSpeed WebAdmin runs its own bundled PHP (often 5.6), which no lsphp or OS update
+  # touches. Its login page is reachable before authentication.
+  for a in $(ls /usr/local/lsws/admin/fcgi-bin/admin_php* 2>/dev/null | while read -r x; do readlink -f "$x"; done | sort -u); do
+    [ -x "$a" ] || continue
+    av="$(timeout 10 "$a" -v 2>/dev/null | awk 'NR==1{print $2}')"
+    classify "$av" On
+    [ "$STATUS" = PATCHED ] && continue
+    addr="$(grep -Eo '^[[:space:]]*address[[:space:]]+[^[:space:]]+' /usr/local/lsws/admin/conf/admin_config.conf 2>/dev/null | awk '{print $2; exit}')"
+    case "${addr:-*:7080}" in 127.*|localhost:*|'[::1]'*)
+      report lsws-admin "$a" "$av" "$STATUS" n/a "LiteSpeed WebAdmin PHP, listens on ${addr} only: keep it that way." ;;
+    *)
+      report lsws-admin "$a" "$av" "$STATUS" n/a "LiteSpeed WebAdmin PHP listens on ${addr:-*:7080}: firewall that port to admin IPs or bind it to 127.0.0.1 (admin_config.conf); lsphp updates don't replace this PHP."
+      [ "$STATUS" = UNKNOWN ] || UNPATCHED=1 ;;
+    esac
   done
 
   # mod_php is the highest-risk setup (php.net, Rapid7): exploitable before any application code runs,
@@ -1065,7 +1085,13 @@ if [ "$MODE" = audit ]; then
   fi
 
   # 8) PHP worker crashes: memory-corruption exploits usually crash workers while they are being tuned
-  CRASH_RE='exited on signal (6|7|11)|SIGSEGV|SIGBUS|Segmentation fault|exit signal Aborted|zend_mm_heap corrupted'
+  CRASH_RE='exited on signal (6|7|11)|SIGSEGV|SIGBUS|Segmentation fault|exit signal Aborted'
+  # 8.4.27 / 8.5.12 themselves corrupt the heap when SimpleXML objects are collected in a cycle (php-src#24488)
+  REGR=""
+  while read -r b; do
+    [ -n "$b" ] || continue
+    case "$("$b" -v 2>/dev/null | awk 'NR==1{print $2}')" in 8.4.27*|8.5.12*) REGR=1 ;; esac
+  done < <(find_php_bins; find_fpm_bins)
   for l in /var/log/php*-fpm.log /var/log/php-fpm/*log /opt/cpanel/ea-php*/root/usr/var/log/php-fpm.log \
            /opt/remi/php*/root/var/log/php-fpm/*log /opt/plesk/php/*/var/log/php-fpm.log \
            /www/server/php/*/var/log/php-fpm.log /var/log/apache2/error*.log /var/log/httpd/error_log \
@@ -1073,6 +1099,11 @@ if [ "$MODE" = audit ]; then
     [ -f "$l" ] || continue
     c="$("${NICE[@]}" tail -n 200000 "$l" 2>/dev/null | grep -Eic "$CRASH_RE")"
     [ "$c" -gt 0 ] && flag "$c PHP/web worker crash line(s) in $l (check timestamps; repeated crashes = exploitation attempts?)"
+    c="$("${NICE[@]}" tail -n 200000 "$l" 2>/dev/null | grep -c 'zend_mm_heap corrupted')"
+    if [ "$c" -gt 0 ]; then
+      if [ -n "$REGR" ]; then info "$c 'zend_mm_heap corrupted' line(s) in $l: on 8.4.27 / 8.5.12 most likely the SimpleXML regression php-src#24488, not an attack"
+      else flag "$c 'zend_mm_heap corrupted' line(s) in $l (heap corruption: exploitation attempts?)"; fi
+    fi
   done
   if command -v journalctl >/dev/null 2>&1; then
     kc="$(journalctl -k --since "${AUDIT_HOURS} hours ago" --no-pager 2>/dev/null | grep -Ec 'segfault at .*(php|lsphp|httpd|apache2)')"
@@ -1091,8 +1122,10 @@ if [ "$MODE" = audit ]; then
     [ -f "$l" ] || continue
     c="$("${NICE[@]}" tail -n 200000 "$l" 2>/dev/null | grep -Ec "$OOM_RE")"
     [ "$c" -gt 0 ] && flag "$c request-startup out-of-memory line(s) ('in Unknown on line 0') in $l: CVE-2026-109618 attempts?"
+    c="$("${NICE[@]}" tail -n 200000 "$l" 2>/dev/null | grep -Ec 'Hard memory limit of [0-9]+ bytes exhausted')"
+    [ "$c" -gt 0 ] && info "$c hard memory limit kill(s) (exit 137) in $l: the fixed PHP stopped an allocation; OOM probes against a patched host, or the sprintf / pack / bin2hex regression php-src#24492"
     c="$("${NICE[@]}" tail -n 200000 "$l" 2>/dev/null | grep -c 'Failed to decode session object')"
-    [ "$c" -gt 0 ] && info "$c 'Failed to decode session object' line(s) in $l (corrupted / planted session data; check together with the crashes above)"
+    [ "$c" -gt 0 ] && info "$c 'Failed to decode session object' line(s) in $l (corrupted / planted session data, check together with the crashes above; on 8.4.27 / 8.5.12 with upload progress on also php-src#24493)"
   done
 
   # 9) PHP dropped into temp directories (write-execute-delete droppers)
