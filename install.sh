@@ -20,7 +20,7 @@
 
 set -u
 
-VERSION="1.15.0"
+VERSION="1.16.0"
 DIRECTIVE="session.upload_progress.enabled"
 TS="$(date +%Y%m%d-%H%M%S)"
 MODE=fix
@@ -162,6 +162,15 @@ SecRule ARGS_NAMES "@gt 1024" \
   "id:1026111,phase:2,deny,status:403,log,t:none,t:length,msg:'php2shell oversized parameter name'"
 SecRule ARGS_NAMES|ARGS "@rx \x00" \
   "id:1026112,phase:2,deny,status:403,log,t:none,msg:'php2shell NUL byte in a parameter'"
+
+############ ModSecurity — response side: PHPSESSID memory disclosure (CVE-2026-109618 leak) ############
+# The leak URL-encodes freed heap memory (passwords, keys, tokens) into a PHPSESSID Set-Cookie. It runs no
+# code, so no process-based detection sees it. Real IDs use only [0-9A-Za-z,-] and are short; '%' or an
+# overlong value is the leak ("deleted" / empty = logout). Headers only (phase 3), no response body access
+# needed. Adjust if you renamed session.name. Blocks the response, so the leaked memory never leaves.
+SecRule RESPONSE_HEADERS:Set-Cookie "@rx (?i)^PHPSESSID=" \
+  "id:1026113,phase:3,deny,status:500,log,msg:'php2shell PHPSESSID memory disclosure',chain"
+  SecRule MATCHED_VAR "!@rx (?i)^PHPSESSID=(?:[0-9a-z,-]{16,256}|deleted)?(?:;|$)" ""
 
 ############ nginx — multipart only on allowlisted paths ############
 # http {} context:
@@ -678,13 +687,17 @@ update_hints() {
     if grep -rqs 'packages.sury.org' /etc/apt/sources.list /etc/apt/sources.list.d; then
       info "  packages.sury.org repository detected (gets fixes first for Debian / Ubuntu on amd64)."
       if [ "$(dpkg --print-architecture 2>/dev/null)" = arm64 ]; then
-        info "    arm64: sury's arm64 builds were still the old 8.2.34 / 8.3.35 / 8.4.26 / 8.5.11 on 22 Oct."
-        info "    Keep this mitigation until apt-cache policy shows 8.2.35 / 8.3.36 / 8.4.27 / 8.5.12. On Ubuntu,"
+        info "    arm64: sury's arm64 builds lag (late 22 Oct only bookworm 8.5.12 was out). What apt offers now:"
+        while read -r p; do
+          c="$(apt-cache policy "$p" 2>/dev/null | awk '/Candidate:/ {print $2}')"
+          info "      $p candidate ${c:-none}"
+        done < <(dpkg-query -W -f '${Package}\n' 'php[5-8].[0-9]-common' 2>/dev/null)
+        info "    Keep this mitigation until the candidate is 8.2.35 / 8.3.36 / 8.4.27 / 8.5.12 or newer. On Ubuntu,"
         info "    ppa:ondrej/php already has fixed arm64 builds of all four branches."
       fi
     elif grep -rqs 'ondrej/php' /etc/apt/sources.list /etc/apt/sources.list.d; then
-      info "  ppa:ondrej/php (Launchpad) can lag behind packages.sury.org (arm64: 8.4 / 8.5 later). If apt offers no fixed build yet,"
-      info "    switching to https://packages.sury.org/php/ gets it sooner."
+      info "  ppa:ondrej/php (Launchpad) has fixed 8.2-8.5 builds on amd64 and arm64. If apt offers no fixed build yet,"
+      info "    run apt-get update; on amd64 https://packages.sury.org/php/ is another source."
     fi
     info "  Distro / sury packages: apt-get update && apt-get install --only-upgrade \$(dpkg-query -W -f='\${binary:Package}\n' '*php*')"
   elif [ -n "$pm" ]; then
@@ -1055,6 +1068,8 @@ if [ "$MODE" = audit ]; then
     [ -f "$l" ] || continue
     c="$("${NICE[@]}" tail -n 200000 "$l" 2>/dev/null | grep -Ec "$OOM_RE")"
     [ "$c" -gt 0 ] && flag "$c request-startup out-of-memory line(s) ('in Unknown on line 0') in $l: CVE-2026-109618 attempts?"
+    c="$("${NICE[@]}" tail -n 200000 "$l" 2>/dev/null | grep -c 'Failed to decode session object')"
+    [ "$c" -gt 0 ] && info "$c 'Failed to decode session object' line(s) in $l (corrupted / planted session data; check together with the crashes above)"
   done
 
   # 9) PHP dropped into temp directories (write-execute-delete droppers)
@@ -1073,6 +1088,22 @@ if [ "$MODE" = audit ]; then
   done < <(ps -eo pid=,ppid=,user=,comm= 2>/dev/null | awk '
     $2 == 1 && $3 ~ /^(www-data|apache|nginx|nobody|http|httpd|wwwrun|lsadm)$/ &&
     $4 ~ /^(sh|bash|dash|zsh|ksh|nc|ncat|netcat|socat|python[0-9.]*|perl|ruby|php)$/ { print $1, $3, $4 }')
+
+  # 11b) Fileless execution: a process whose binary is a memfd or a deleted file (dropper ran, then removed itself).
+  #      Daemons whose package was upgraded also show "(deleted)": only web-user binaries outside /usr, /opt count.
+  while read -r d t; do
+    pid="${d#/proc/}"
+    u="$(ps -o user= -p "$pid" 2>/dev/null | tr -d ' ')"
+    case "$t" in
+      /memfd:runc_cloned*) ;;   # runc re-executes itself from a memfd
+      /memfd:*) flag "Process $pid ($u) runs from memory (memfd, fileless): $(ps -o args= -p "$pid" 2>/dev/null | cut -c1-150)" ;;
+      *' (deleted)')
+        case "$u" in www-data|apache|nginx|nobody|http|httpd|wwwrun|lsadm)
+          case "$t" in /usr/*|/opt/*|/www/server/*) ;;   # package upgrade of a running daemon
+            *) flag "Process $pid ($u) runs a deleted binary: $t" ;; esac ;;
+        esac ;;
+    esac
+  done < <(find /proc -mindepth 2 -maxdepth 2 -name exe \( -lname '/memfd:*' -o -lname '* (deleted)' \) -printf '%h %l\n' 2>/dev/null)
 
   # 12) Network connections owned by shells / interpreters
   if command -v ss >/dev/null 2>&1; then

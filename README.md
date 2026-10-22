@@ -48,7 +48,7 @@ curl -fsSL https://raw.githubusercontent.com/ersinkoc/php-fix/main/install.sh | 
 Piping `main` into `sudo bash` means trusting whatever is on `main` at that moment. For production, use a release instead. Every release is built by GitHub Actions and ships with a `SHA256SUMS` file and a signed [build provenance attestation](https://docs.github.com/actions/security-for-github-actions/using-artifact-attestations):
 
 ```bash
-V=v1.15.0
+V=v1.16.0
 curl -fsSLO https://github.com/ersinkoc/php-fix/releases/download/$V/install.sh
 curl -fsSLO https://github.com/ersinkoc/php-fix/releases/download/$V/SHA256SUMS
 sha256sum -c SHA256SUMS                                      # integrity
@@ -147,6 +147,8 @@ This is a heuristic sweep, not proof either way. Every finding needs a human to 
 - PHP files dropped in `/tmp`, `/var/tmp` or `/dev/shm`
 - Reverse-shell command lines on any process (`/dev/tcp/`, `mkfifo … nc`, `nc -e`, `bash -i`, `socat … exec`, `fsockopen`, `pty.spawn`)
 - Shells or interpreters running as a web user (`www-data`, `apache`, `nginx`, `nobody`, …) and detached from their parent (double-forked)
+- **Fileless execution**: any process whose binary is a `memfd` (run straight from memory), and web-user processes whose binary outside `/usr` / `/opt` was deleted after start (dropper ran, then removed itself). Inside a container without `CAP_SYS_PTRACE` root can't see other users' binaries, so run `--audit` on the host
+- `Failed to decode session object` in PHP / FPM logs: corrupted or planted session data. Context only; it matters next to worker crashes
 - Shells or interpreters holding network connections (`ss`)
 - Running PHP Docker containers, which this script cannot reach
 
@@ -212,13 +214,14 @@ The tests cover:
 - **Ubuntu:** `--check` recognizes 24.04's `8.3.6-0ubuntu0.24.04.13` as fixed from the USN table, and reports a build older than the table entry as unpatched
 - **After an update:** `--check` reports FPM workers still running a replaced binary, prints update and restart hints, and stops reporting once FPM is restarted. It warns about `memory_limit = -1` left on a patched FPM, but not on CLI, where `-1` is the default
 - **`--audit` and `--check`:**
+  - `--audit` flags a web-user process running a deleted binary and reports `Failed to decode session object` lines. The PHPSESSID disclosure rule from `--waf-print` is checked against real IDs (32 hex, 26-char base32, `deleted`) and against URL-encoded and overlong leaks
   - `--audit` flags a planted webshell, a worker `SIGSEGV` log line, a request-startup OOM (`in Unknown on line 0`, while an ordinary in-script OOM is ignored), a PHP file in `/tmp`, a reverse-shell command line, and a multipart request answered with `502` in a `Content-Type`-logging access log
   - `--audit` flags an image polyglot (`GIF89a<?php`) and an `avatar.php.jpg`, and leaves a clean image alone
   - `--audit` finds a published IOC address and a `php://filter` read-back in a **rotated, gzipped** access log, reports a `php2shell-scan` user agent, and flags a session file carrying a `PWNED::` webshell. `--audit=exposure` computes the window back to 17 Oct
   - `--audit` output stays clean when file names carry terminal escapes (ESC, 8-bit and UTF-8 C1)
   - `--check` runs; the EOL warning and the `< 5.4` exit `2` path are tested with stub binaries
 
-Run the tests locally with: `docker run --rm -v "$PWD:/src:ro" debian:trixie bash /src/tests/run.sh`
+Run the tests locally with: `docker run --rm --cap-add SYS_PTRACE -v "$PWD:/src:ro" debian:trixie bash /src/tests/run.sh`
 
 ### Supported environments
 
@@ -293,7 +296,7 @@ This changes hour by hour. Check the vendor's page, then confirm with `--check`.
 | **Imunify360** WAF (cPanel, Plesk, CloudLinux) | ModSecurity vendor rules | ✅ ruleset **8.83** blocks the public exploit shape on Apache; **8.84 / 8.85 also block on LiteSpeed**. Scanning IPs get a CAPTCHA. Interim only | `imunify360-agent update --force modsec-rules`. `--check` reports the installed ruleset version |
 | **Cloudflare** WAF | edge | ✅ temporary rules for the known exploit vectors, for all plans including Free. Only covers traffic that goes through Cloudflare; the CTO calls it "a STOPGAP only" | nothing to do; lock the origin to Cloudflare IPs, or the rules can be bypassed |
 | **Check Point** IPS / WAF | gateway | ✅ IPS protection CPAI-2026-15172 | set new critical protections to Prevent. TLS traffic must be inspected |
-| **packages.sury.org** (Debian 12/13, Ubuntu 22.04/24.04) | `/etc/php/X.Y` | ✅ 8.2–8.5 on amd64. ⏳ **arm64 still on the old builds** (checked twice on 22 Oct, bookworm and trixie arm64: 8.2.34 / 8.3.35 / 8.4.26 / 8.5.11). `--check` warns on arm64 hosts | `apt-get install --only-upgrade 'php8.3*'`. On arm64, check `apt-cache policy php8.3` |
+| **packages.sury.org** (Debian 12/13, Ubuntu 22.04/24.04) | `/etc/php/X.Y` | ✅ 8.2–8.5 on amd64. ⏳ **arm64 mostly still on the old builds.** Package index read late on 22 Oct: bookworm arm64 has **8.5.12** but still 8.2.34 / 8.3.35 / 8.4.26; trixie arm64 still 8.2.34 / 8.3.35 / 8.4.26 / 8.5.11. The maintainer says arm builds run under qemu and have "a much longer tail". On arm64 hosts `--check` prints what apt offers for each installed branch | `apt-get install --only-upgrade 'php8.3*'`. On arm64, check `apt-cache policy php8.3` |
 | **ppa:ondrej/php** (Launchpad) | `/etc/php/X.Y` | ✅ 8.2–8.5 on amd64 and arm64 (arm64 8.5 since 21:22 UTC) | `apt upgrade`. Ubuntu on arm64: this is the fixed source while sury's arm64 lags |
 | **Ubuntu** own packages | `/etc/php/X.Y` | ✅ every release, including ESM ([USN-8948-1 / -2](https://ubuntu.com/blog/php2shell-vulnerability-fixes-available)). See [Ubuntu](#ubuntu) below | `apt upgrade` |
 | **Debian** own packages | `/etc/php/X.Y` | ✅ 13 trixie `8.4.27-1~deb13u1` ([DSA-6574-1](https://security-tracker.debian.org/tracker/CVE-2026-109618)), ✅ 12 bookworm `8.2.35-1~deb12u1` (DLA-4848-1), ✅ sid `8.4.27-1`. ⏳ forky (testing) still `8.4.26-1`. 11: no free fix | `apt upgrade` |
@@ -380,6 +383,7 @@ The OOM bug is reached mainly through PHP's multipart parser, and no PHP setting
 - **Log `Content-Type`.** Default access logs don't record it, so multipart probing is invisible. `--waf-print` includes nginx `log_format` and Apache `LogFormat` snippets, and `--audit` uses them.
 - **Know what you'll break:** file uploads, `FormData`/AJAX forms, Contact Form 7 (multipart even without files) and Livewire/Filament uploads stop working outside the allowlist.
 - **Multipart is not the only way in.** Datadog reached the OOM path with a plain `application/x-www-form-urlencoded` POST: one field name of about 3.5 MB, plus an empty-named field holding NUL bytes. A multipart block doesn't stop that. Cap request bodies too (nginx `client_max_body_size 8m`, Apache `LimitRequestBody 8388608`, larger only on upload paths). `--waf-print` adds ModSecurity rules for parameter names over 1 KB and NUL bytes in parameters. Your WAF body-inspection limit (`SecRequestBodyLimit`) must be at least that large, or the rule never sees the field.
+- **Watch responses, not just requests.** The CVE-2026-109618 memory leak sends freed worker memory (passwords, API keys, session tokens of other users) back URL-encoded in a `PHPSESSID` `Set-Cookie`, even if the app never calls `session_start()` ([Wiz](https://www.wiz.io/blog/php2shell-php-rce), [Sansec](https://sansec.io/research/php2shell)). No code runs on the host, so EDR and process rules can't see it. `--waf-print` adds a ModSecurity phase-3 rule that blocks any `PHPSESSID` cookie that isn't a plain ID (`[0-9A-Za-z,-]`, 16–256 chars) or a logout (`deleted`). If you renamed `session.name`, edit the rule. If the leak may already have happened, rotate the secrets the PHP process can read.
 - The narrow ModSecurity rule, which blocks only the `PHP_SESSION_UPLOAD_PROGRESS` field, is safe for almost every site. ModSecurity's multipart parser isn't PHP's, though, so treat it as a filter, not a guarantee.
 
 To check from outside that your edge really rejects multipart, test against a PHP file, not `/`:
@@ -553,6 +557,9 @@ Timeline note: the fix and advisories are public, so the patch diff now shows at
 - [Apache-level multipart blocking toolkit: syhunt/php2shell-protection](https://github.com/syhunt/php2shell-protection)
 - [Sansec: Critical PHP RCE](https://sansec.io/research/php2shell)
 - [Aikido: patched images and exposure checker](https://www.aikido.dev/blog/critical-vulnerabilities-in-php-php2shell)
+- [Wiz: PHP2Shell write-up (PHPSESSID memory leak)](https://www.wiz.io/blog/php2shell-php-rce)
+- [PHP2Shell detection opportunities (Sigma / Suricata / ModSecurity / Falco)](https://gist.github.com/Blevene/472692937d05145d29d17dc3c6edc2a0)
+- [deb.sury.org issue #145: arm64 build status](https://codeberg.org/oerdnj/deb.sury.org/issues/145)
 - [Huntress: Rapid Response, php2shell](https://www.huntress.com/blog/php2shell-leaked-critical-php-vulnerabilities)
 - [Vincent Schmalbach: what you should do now](https://www.vincentschmalbach.com/cve-2026-109618-and-cve-2026-109619-what-you-should-do-now/)
 - [Amazon Threat Intelligence: exploitation before disclosure in MadPot (17 Oct)](https://aws.amazon.com/blogs/security/amazon-threat-intelligence-identifies-php2shell-exploitation-prior-to-public-disclosure-in-madpot/)

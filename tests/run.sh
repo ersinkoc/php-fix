@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # End-to-end tests for install.sh. Runs as root inside a throwaway container:
-#   docker run --rm -v "$PWD:/src:ro" debian:trixie bash /src/tests/run.sh
+#   docker run --rm --cap-add SYS_PTRACE -v "$PWD:/src:ro" debian:trixie bash /src/tests/run.sh
 # Installs PHP with the distro package manager, then exercises every mode.
 
 set -u
@@ -333,6 +333,34 @@ if command -v dpkg-deb >/dev/null; then
     && pass "CloudLinux ea-php build not judged by cPanel release numbers" || fail "CloudLinux ea-php judged by cPanel release numbers: $out"
   dpkg -r ea-php74-php-cli >/dev/null 2>&1; rm -rf "$PK" /tmp/ea-php74.deb; rmdir -p /opt/cpanel/ea-php74/root/usr/bin 2>/dev/null
 fi
+
+echo "== --audit: fileless / deleted binary, session decode failures"
+cp "$(command -v bash)" /tmp/phpfix-dropbin && chmod 755 /tmp/phpfix-dropbin   # not sleep: a multi-call coreutils on EL
+setsid su -s /bin/sh "$WEBUSER" -c 'exec /tmp/phpfix-dropbin -c "sleep 120; :"' >/dev/null 2>&1 &
+DPID=""; for _ in $(seq 50); do DPID="$(pgrep -f '^/tmp/phpfix-dropbin')" && break; sleep 0.1; done
+rm -f /tmp/phpfix-dropbin
+echo "WARNING: [pool www] PHP Warning:  session_start(): Failed to decode session object. Session has been destroyed" >> /var/log/phptest-fpm.log
+out="$(bash $S --audit 2>&1)"
+if [ -z "$DPID" ]; then
+  fail "test dropper process did not start"
+elif readlink "/proc/$DPID/exe" >/dev/null 2>&1; then
+  echo "$out" | grep -q "($WEBUSER) runs a deleted binary: /tmp/phpfix-dropbin" && pass "audit flags a web-user process running a deleted binary" || fail "audit missed deleted binary"
+else
+  pass "deleted-binary check skipped: root cannot read other users' /proc/PID/exe here (no CAP_SYS_PTRACE)"
+fi
+echo "$out" | grep -q "1 'Failed to decode session object' line(s)" && pass "audit reports session decode failures" || fail "audit missed session decode failures"
+pkill -f phpfix-dropbin 2>/dev/null; rm -f /var/log/phptest-fpm.log
+
+echo "== --waf-print: PHPSESSID disclosure rule"
+re="$(bash $S --waf-print | sed -n 's/^  SecRule MATCHED_VAR "!@rx \(.*\)" ""$/\1/p')"
+[ -n "$re" ] && RE="$re" php -r '
+$re = "/" . str_replace("/", "\/", getenv("RE")) . "/";
+$good = ["PHPSESSID=0123456789abcdef0123456789abcdef; path=/; HttpOnly", "PHPSESSID=deleted; expires=Thu, 01 Jan 1970 00:00:01 GMT",
+         "PHPSESSID=a1B2c3D4e5F6g7H8i9J0k1L2m3; path=/", "phpsessid=Ab,-0123456789abcdef"];
+$bad  = ["PHPSESSID=%00%01%02secret%3Dhunter2; path=/", "PHPSESSID=" . str_repeat("a", 300) . "; path=/"];
+foreach ($good as $c) if (!preg_match($re, $c)) { echo "false positive: $c\n"; exit(1); }
+foreach ($bad as $c)  if (preg_match($re, $c))  { echo "missed: $c\n"; exit(1); }' \
+  && pass "PHPSESSID rule passes real IDs / logout, catches leaks" || fail "PHPSESSID rule regex"
 
 echo "== --check: Imunify360 WAF ruleset version"
 IMV=/etc/apache2/conf.d/modsec_vendor_configs/imunify360-full-apache

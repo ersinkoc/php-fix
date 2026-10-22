@@ -22,4 +22,4 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: End-to-end tests on ${{ matrix.image }}
-        run: docker run --rm -v "$PWD:/src:ro" "${{ matrix.image }}" bash /src/tests/run.sh
+        run: docker run --rm --cap-add SYS_PTRACE -v "$PWD:/src:ro" "${{ matrix.image }}" bash /src/tests/run.sh
