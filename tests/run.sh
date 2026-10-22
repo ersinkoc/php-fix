@@ -372,6 +372,11 @@ echo 8.85 > "$IMV/VERSION"
 bash $S --check 2>&1 | grep -q 'Imunify360 WAF rules 8.85 (>= 8.85' && pass "Imunify360 8.85 recognised" || fail "Imunify360 8.85 not recognised"
 rm -rf /etc/apache2/conf.d/modsec_vendor_configs; rmdir /etc/apache2/conf.d /etc/apache2 2>/dev/null
 
+if [ "$MODPHP" = 1 ] && grep -qs LoadModule /etc/apache2/mods-enabled/php*.load; then
+  echo "== --check: mod_php risk note"
+  bash $S --check 2>&1 | grep -q 'Apache mod_php is loaded: the highest-risk' && pass "--check notes mod_php as the highest-risk setup" || fail "mod_php note missing"
+fi
+
 echo "== --check knows the fixed versions"
 out="$(bash $S --check 2>&1)"
 echo "$out" | grep -Eq '(PATCHED|EOL), mitigation' && ! echo "$out" | grep -q 'fixed versions not known' && pass "--check classifies against the fixed versions" || fail "--check still unknown"

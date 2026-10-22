@@ -35,7 +35,7 @@ Imperva reproduced five exploitation techniques on top of these bugs:
 
 Turning upload progress off removes the trigger for three of the five. For the OPcache path, Imperva lists `opcache.enable = 0` as a temporary measure. PHP's advisories don't mention it, and it costs a lot of CPU. `--interim` shows whether OPcache is on in each pool.
 
-Red Hat rates the bugs *Important* rather than *Critical* for standard RHEL, because RHEL uses PHP-FPM, not mod_php: FPM workers exit on an early startup failure before they reach the corrupted state. That makes RCE harder on FPM, not impossible. The upload-progress path is confirmed against FPM too.
+Red Hat rates the bugs *Important* rather than *Critical* for standard RHEL, because RHEL uses PHP-FPM, not mod_php: FPM workers exit on an early startup failure before they reach the corrupted state. That makes RCE harder on FPM, not impossible. The upload-progress path is confirmed against FPM too. [Rapid7](https://www.rapid7.com/blog/post/etr-cve-2026-109618-and-cve-2026-109619-critical-unauthenticated-remote-code-execution-in-php/) reports the same: no complete FPM exploit for CVE-2026-109618 so far, while on mod_php it works with default limits, prefork included. `--check` says so when Apache has mod_php loaded: patch those hosts first, and consider moving the sites to PHP-FPM.
 
 ## Quick start
 
@@ -48,7 +48,7 @@ curl -fsSL https://raw.githubusercontent.com/ersinkoc/php-fix/main/install.sh | 
 Piping `main` into `sudo bash` means trusting whatever is on `main` at that moment. For production, use a release instead. Every release is built by GitHub Actions and ships with a `SHA256SUMS` file and a signed [build provenance attestation](https://docs.github.com/actions/security-for-github-actions/using-artifact-attestations):
 
 ```bash
-V=v1.16.0
+V=v1.17.0
 curl -fsSLO https://github.com/ersinkoc/php-fix/releases/download/$V/install.sh
 curl -fsSLO https://github.com/ersinkoc/php-fix/releases/download/$V/SHA256SUMS
 sha256sum -c SHA256SUMS                                      # integrity
@@ -214,6 +214,7 @@ The tests cover:
 - **Ubuntu:** `--check` recognizes 24.04's `8.3.6-0ubuntu0.24.04.13` as fixed from the USN table, and reports a build older than the table entry as unpatched
 - **After an update:** `--check` reports FPM workers still running a replaced binary, prints update and restart hints, and stops reporting once FPM is restarted. It warns about `memory_limit = -1` left on a patched FPM, but not on CLI, where `-1` is the default
 - **`--audit` and `--check`:**
+  - `--check` notes a loaded Apache mod_php as the highest-risk setup
   - `--audit` flags a web-user process running a deleted binary and reports `Failed to decode session object` lines. The PHPSESSID disclosure rule from `--waf-print` is checked against real IDs (32 hex, 26-char base32, `deleted`) and against URL-encoded and overlong leaks
   - `--audit` flags a planted webshell, a worker `SIGSEGV` log line, a request-startup OOM (`in Unknown on line 0`, while an ordinary in-script OOM is ignored), a PHP file in `/tmp`, a reverse-shell command line, and a multipart request answered with `502` in a `Content-Type`-logging access log
   - `--audit` flags an image polyglot (`GIF89a<?php`) and an `avatar.php.jpg`, and leaves a clean image alone
@@ -304,7 +305,7 @@ This changes hour by hour. Check the vendor's page, then confirm with `--check`.
 | **AlmaLinux** | `/etc/php.ini` | 🔄 [every stream in **almalinux-testing**](https://almalinux.org/blog/2026-10-21-php2shell-cve-2026-109618-cve-2026-109619/) (retired ones too), production next. Old version numbers with `.alma.1`, e.g. 9: `php-8.0.30-8.el9_8.alma.1`, 10: `php-8.3.33-1.el10_2.alma.1`. 8 php:7.4 (`php-7.4.33-8.module_el8.10.0+4321+cf5fd4bb`) is already in production | `dnf install -y almalinux-release-testing && dnf upgrade 'php*' --enablerepo=almalinux-testing`. Check with `rpm -q php-common`, not `php -v` |
 | **Amazon Linux** | `/etc/php.ini` | ✅ AL2023 since 22 Oct: php8.2 ALAS2023-2026-3301, php8.3 -3302, php8.4 -3303, php8.5 -3304 ([ALAS](https://explore.alas.aws.amazon.com/CVE-2026-109618.html)). ❌ AL2023 php8.1: no fix planned. ✅ AL2 Extras php8.2 (ALAS2PHP8.2-2026-015); AL2 core php: no fix planned. Elastic Beanstalk PHP platform v4.13.12 carried settings only; a release with the upstream fix was targeted for 22 Oct. **Lightsail** instances can't be updated in place: create a new one from the updated blueprint | AL2023: `dnf check-release-update`, then `dnf upgrade --releasever=latest`. AL2: `yum update 'php*'` |
 | **Alpine** | `/etc/php8X` | ✅ 3.24 and edge (x86_64, aarch64): php83 `8.3.36-r0`, php84 `8.4.27-r0`, php85 `8.5.12-r0` ([secdb](https://secdb.alpinelinux.org/)). ❌ 3.23 and older won't get a fix (Alpine developer) | `apk upgrade`; on 3.23 and older, move to 3.24 |
-| **Remi** | `/etc/opt/remi`, `/opt/remi` | ✅ 8.2.35 / 8.3.36 / 8.4.27 / 8.5.12 on rpms.remirepo.net (21 Oct, evening). Some mirrors lag. The earlier 8.4.27RC1 / 8.5.12RC1 builds do **not** contain the fix | `dnf clean metadata && dnf upgrade 'php*'` (SCL: `'php8[0-9]-*'`) |
+| **Remi** | `/etc/opt/remi`, `/opt/remi` | ✅ 8.2.35 / 8.3.36 / 8.4.27 / 8.5.12 in remi-modular and as SCL in remi-safe, EL 8–10 and Fedora, x86_64 and aarch64 ([announced 22 Oct](https://blog.remirepo.net/post/2026/10/22/PHP-version-8.2.35-8.3.36-8.4.27-8.5.12)). ✅ **SCL backports at the old number** (changelog read from the EL9 RPMs): php74 `7.4.33-31`, php80 `8.0.30-21`, php81 `8.1.34-6`; `--check` finds the CVE ids there. Some mirrors lag. The earlier 8.4.27RC1 / 8.5.12RC1 builds do **not** contain the fix | `dnf clean metadata && dnf upgrade 'php*'` (SCL: `'php[78][0-9]-*'`) |
 | **LiteSpeed lsphp** (LiteSpeed repo, CyberPanel) | `/usr/local/lsws/lsphpXY` | ⏳ no fixed lsphp build confirmed on 22 Oct ([OpenLiteSpeed #532](https://github.com/litespeedtech/openlitespeed/issues/532)). `apt upgrade 'php*'` doesn't touch lsphp | `apt-get install --only-upgrade 'lsphp*'` / `dnf upgrade 'lsphp*'`, check the version, then `lswsctrl restart` |
 | **Docker `php` image** | inside the image | ✅ `8.2.35`, `8.3.36`, `8.4.27`, `8.5.12` tags on Docker Hub (from 21 Oct, ~17:30 UTC). `*RC1` tags don't contain the fix | `docker build --pull`, then `docker compose up -d --force-recreate`. Check with `docker run --rm php:8.4-fpm php -v` |
 | Gentoo / Arch / Homebrew / windows.php.net | — | ✅ (Arch: 8.3, 8.5 only) | package manager / download |
@@ -340,6 +341,18 @@ sudo pro attach <token>     # 20.04 and older only: Ubuntu Pro is free for up to
 - These are Ubuntu's own builds. **On ondrej/sury packages** (versions with `deb.sury.org`) this table doesn't apply. Those need 8.2.35 / 8.3.36 / 8.4.27 / 8.5.12.
 - **unattended-upgrades** installs the fix within 24 hours, but **doesn't restart PHP**. Restart PHP-FPM and Apache yourself, or reboot. `--check` reports workers that still run the replaced code.
 - `--check` also applies to 20.04 and older: an ESM build at or above the table is PATCHED, and an older one is reported with the `pro attach` hint.
+
+### Appliances and products that bundle PHP
+
+php-fix can't reach PHP inside a vendor appliance or a closed product. Follow the vendor (status of 22 October 2026, [Help Net Security](https://www.helpnetsecurity.com/2026/10/22/php2shell-vulnerability-fortinet-cisco-palo-alto-networks/)):
+
+| Vendor | Status |
+|---|---|
+| **Palo Alto Networks** | ❌ **PAN-OS and Panorama, all versions affected, no fixed release yet.** Threat Prevention signatures 543004, 97622–97625 (21 Oct). Keep management interfaces off the internet. Cloud NGFW, Prisma Access, Cortex XDR agent / XSOAR / Xpanse are not affected |
+| **Fortinet** | ⏳ FG-IR-26-186: nothing confirmed affected. FortiADC, FortiClient EMS, FortiDDoS, FortiSIEM, FortiSOAR, FortiMonitor and others under investigation. FortiOS, FortiManager, FortiAnalyzer, FortiWeb, FortiMail not affected |
+| **Cisco** | ⏳ cisco-sa-php-october26-Jj384Daq: ISE, Catalyst Center, SD-WAN Manager, Expressway, AppDynamics PHP Agent and others under investigation |
+
+Inventory everything that serves HTTP and may embed PHP (NAS boxes, panels, monitoring, helpdesk and VPN appliances), not only your own servers.
 
 ### Commands
 

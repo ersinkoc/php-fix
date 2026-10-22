@@ -20,7 +20,7 @@
 
 set -u
 
-VERSION="1.16.0"
+VERSION="1.17.0"
 DIRECTIVE="session.upload_progress.enabled"
 TS="$(date +%Y%m%d-%H%M%S)"
 MODE=fix
@@ -680,8 +680,9 @@ update_hints() {
     info "    Check the lsphp build is 8.2.35 / 8.3.36 / 8.4.27 / 8.5.12 or newer, then: /usr/local/lsws/bin/lswsctrl restart"
   fi
   if ls /etc/yum.repos.d/remi*.repo >/dev/null 2>&1 || [ -d /opt/remi ]; then
-    info "  Remi: ${pm:-dnf} upgrade 'php*' (module stream) or 'php8[0-9]-*' (SCL /opt/remi). 8.2.35 / 8.3.36 / 8.4.27 / 8.5.12"
-    info "    are on rpms.remirepo.net since 21 Oct. Some mirrors lag: ${pm:-dnf} clean metadata, then upgrade again."
+    info "  Remi: ${pm:-dnf} upgrade 'php*' (module stream) or 'php[78][0-9]-*' (SCL /opt/remi). 8.2.35 / 8.3.36 / 8.4.27 / 8.5.12"
+    info "    announced 22 Oct; SCL backports at the old number: php74 7.4.33-31, php80 8.0.30-21, php81 8.1.34-6."
+    info "    Some mirrors lag: ${pm:-dnf} clean metadata, then upgrade again."
   fi
   if [ "$pm" = apt ]; then
     if grep -rqs 'packages.sury.org' /etc/apt/sources.list /etc/apt/sources.list.d; then
@@ -791,6 +792,14 @@ if [ "$MODE" = check ]; then
     elif [ -n "$iv" ] && ver_ge "$iv" 8.83; then info "Imunify360 WAF rules $iv: 8.84+ also blocks the tool on LiteSpeed, 8.85 more variants: imunify360-agent update --force modsec-rules"
     else err "Imunify360 WAF rules ${iv:-unknown} are older than 8.83: imunify360-agent update --force modsec-rules"; fi
   done
+
+  # mod_php is the highest-risk setup (php.net, Rapid7): exploitable before any application code runs,
+  # and unlike FPM a worker whose request startup failed keeps serving (CVE-2026-109618).
+  if [ "$JSON" -eq 0 ] && grep -RqsE '^[[:space:]]*LoadModule[[:space:]]+php[0-9_]*_module' \
+       /etc/apache2/mods-enabled /etc/httpd/conf.modules.d /etc/httpd/conf.d /usr/local/apache/conf 2>/dev/null; then
+    info "Apache mod_php is loaded: the highest-risk php2shell setup (exploitable before app code runs; FPM ends a"
+    info "  worker whose request startup failed). Patch it first, and consider moving the sites to PHP-FPM."
+  fi
 
   # Updated on disk but the old code is still running: the update does not count until a restart
   stale="$(stale_php | awk '{printf "%s%s (%s)", (NR>1?", ":""), $2, $1}')"
