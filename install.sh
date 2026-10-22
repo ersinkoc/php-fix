@@ -9,6 +9,7 @@
 #   ... | sudo bash -s -- --no-restart   # do not reload PHP / web services
 #   ... | sudo bash -s -- --check        # read-only: patched / unpatched / EOL per PHP binary
 #   ... | sudo bash -s -- --audit        # read-only: quick indicator-of-compromise sweep
+#   ... | sudo bash -s -- --audit=exposure   # same, for the whole window since the first attacks (17 Oct)
 #   ... | sudo bash -s -- --interim      # read-only: which interim measures are in effect, and what makes it worse
 #   ... | bash -s -- --waf-print         # print WAF / proxy rules for the multipart path, change nothing
 #   ... | sudo bash -s -- --revert       # restore the backups of the last run
@@ -24,7 +25,7 @@ OS="$(uname -s)"
 case ":$PATH:" in *:/usr/local/sbin:*) ;; *) PATH="$PATH:/usr/local/sbin" ;; esac
 case ":$PATH:" in *:/usr/local/bin:*) ;; *) PATH="$PATH:/usr/local/bin" ;; esac
 
-VERSION="1.12.0"
+VERSION="1.13.0"
 DIRECTIVE="session.upload_progress.enabled"
 TS="$(date +%Y%m%d-%H%M%S)"
 MODE=fix
@@ -50,6 +51,12 @@ UBUNTU_USN="USN-8948-1 / USN-8948-2"
 # cPanel EA4 25.91 backports the fix into ea-php74 / 80 / 81 at the same version: branch:first fixed release.
 # CloudLinux ships its own ea-php builds (release *.cloudlinux.N, numbered differently): those go by changelog.
 CPANEL_FIXED="${PHPFIX_CPANEL_FIXED:-74:19 80:12 81:5}"
+# Earliest exploitation attempt seen (Amazon MadPot honeypot, 17 Oct 2026, four days before disclosure).
+FIRST_SEEN="2026-10-17T00:00:00Z"
+# Published indicators. Shared hosting / anonymization addresses, not exclusive to this activity:
+# investigate hits, don't treat them as proof. Amazon Threat Intelligence + VulnCheck (21 Oct 2026).
+IOC_IPS="103.216.220.92 31.223.184.166 37.19.200.5 134.209.159.64 103.114.163.188 95.217.98.37
+  85.11.167.243 45.198.224.169 109.71.252.97 221.14.159.134 91.90.123.25"
 
 usage() {
   cat <<EOF
@@ -60,6 +67,7 @@ Usage: install.sh [mode] [options]
 Modes (default: apply the mitigation):
   --check            Read-only. Report patched / unpatched / EOL for every PHP binary.
   --audit[=HOURS]    Read-only. Quick indicator-of-compromise sweep (default: last 48 h).
+                     --audit=exposure covers everything since the first attacks (17 Oct 2026).
   --interim          Read-only. Which interim measures are in effect per FPM binary / live pool,
                      and settings that make the OOM bug easier to reach (RLIMIT_AS / RLIMIT_DATA).
   --waf-print        Print WAF / proxy rules for the multipart path. Changes nothing.
@@ -81,6 +89,7 @@ for arg in "$@"; do
     --no-restart) NO_RESTART=1 ;;
     --check)      MODE=check ;;
     --audit)      MODE=audit ;;
+    --audit=exposure) MODE=audit; AUDIT_HOURS="$(( ($(date +%s) - $(date -d "$FIRST_SEEN" +%s)) / 3600 + 1 ))" ;;
     --audit=*)    MODE=audit; AUDIT_HOURS="${arg#*=}" ;;
     --waf-print)  MODE=waf ;;
     --interim)    MODE=interim ;;
@@ -202,6 +211,20 @@ http-request deny if php2shell_mp !php2shell_ok
 # (any(lower(http.request.headers["content-type"][*])[*] contains "multipart")
 #  and not http.request.uri.path in {"/wp-admin/async-upload.php" "/wp-admin/media-new.php"})
 # IP Access "Allow" rules skip custom rules. Restrict the origin to Cloudflare IP ranges.
+
+############ AWS WAF (web ACL rule JSON; ALB / CloudFront / API Gateway) ############
+# Any method, "multipart" anywhere in Content-Type, outside the allowlist. Start in Count, then Block.
+# The AWS managed PHP rule group (version 2.3, now the default) adds a php2shell rule; AWS's own sample
+# matches POST + PHPSESSID only, which misses PUT/PATCH and sessions under another name.
+# WAF inspects only the first 8 KB of an ALB body (16-64 KB CloudFront), so it cannot see part headers deep
+# in a body: keep AWSManagedRulesCommonRuleSet SizeRestrictions_BODY on where uploads allow it.
+# {"Name":"php2shell-multipart","Priority":0,"Action":{"Count":{}},
+#  "VisibilityConfig":{"SampledRequestsEnabled":true,"CloudWatchMetricsEnabled":true,"MetricName":"php2shellMultipart"},
+#  "Statement":{"AndStatement":{"Statements":[
+#   {"ByteMatchStatement":{"SearchString":"multipart","FieldToMatch":{"SingleHeader":{"Name":"content-type"}},
+#     "TextTransformations":[{"Priority":0,"Type":"LOWERCASE"}],"PositionalConstraint":"CONTAINS"}},
+#   {"NotStatement":{"Statement":{"RegexMatchStatement":{"RegexString":"^/(wp-admin/async-upload\\.php|wp-admin/media-new\\.php)$",
+#     "FieldToMatch":{"UriPath":{}},"TextTransformations":[{"Priority":0,"Type":"NONE"}]}}}}]}}}
 
 ############ Logging: record Content-Type so multipart traffic is visible ############
 # Default access logs don't contain Content-Type, so multipart probing is invisible.
@@ -661,28 +684,38 @@ update_hints() {
     info "    da update && da build php   (8.2-8.5 get the new versions; 7.4 / 8.0 / 8.1 get patches, shown with a * in CustomBuild)"
     info "    DA updates itself, but PHP is only rebuilt by hand (or by the CustomBuild cron, if enabled)."
   fi
-  case "$(. /etc/os-release 2>/dev/null; echo "${ID:-}:${VERSION_CODENAME:-}")" in
+  case "$(. /etc/os-release 2>/dev/null; echo "${ID:-}:${VERSION_CODENAME:-${VERSION_ID:-}}")" in
     debian:bookworm) info "  Debian 12: php8.2 8.2.35-1~deb12u1 (DLA-4848-1, via the security archive)" ;;
     debian:trixie)   info "  Debian 13: php8.4 8.4.27-1~deb13u1 (DSA-6574-1)" ;;
+    debian:forky)    info "  Debian testing (forky): php8.4 was still 8.4.26-1 (vulnerable) on 22 Oct; sid has 8.4.27-1. Use sid's build or packages.sury.org" ;;
     almalinux:*)
       info "  AlmaLinux: fixed builds for every stream (retired ones too) keep the old number with an .alma.1 suffix,"
       info "    e.g. 9: php-8.0.30-8.el9_8.alma.1. Until they reach production (8 php:7.4 already has):"
       info "    dnf install -y almalinux-release-testing && dnf upgrade 'php*' --enablerepo=almalinux-testing"
       info "    Verify with rpm -q php-common (not php -v). https://almalinux.org/blog/" ;;
     rhel:*)
-      info "  RHEL: RHSA-2026:87072 fixes php:8.2 on RHEL 9 (php-8.2.35-1.module+el9.8). Other streams: watch"
-      info "    https://access.redhat.com/security/cve/cve-2026-109618 and dnf updateinfo list --security" ;;
+      info "  RHEL 9: RHSA-2026:87072 (php:8.2 -> php-8.2.35-1.module+el9.8) and RHSA-2026:87079 (php:8.3 -> php-8.3.36-1.module+el9.8)."
+      info "    Other streams and RHEL 8 / 10: watch RHSB-2026-013 and dnf updateinfo list --security" ;;
     rocky:*)
-      info "  Rocky Linux follows RHEL errata (RHSA-2026:87072: php:8.2 on 9). Others: dnf updateinfo list --security" ;;
+      info "  Rocky Linux follows RHEL errata (RHSA-2026:87072 / 87079: php:8.2 / php:8.3 on 9). Others: dnf updateinfo list --security" ;;
+    amzn:2023)
+      info "  Amazon Linux 2023: fixed since 22 Oct (ALAS2023-2026-3301 php8.2, -3302 php8.3, -3303 php8.4, -3304 php8.5):"
+      info "    fixes ship in new repository versions: dnf check-release-update, then dnf upgrade --releasever=latest"
+      info "    php8.1 gets no fix (No Fix Planned): move to php8.2 or newer." ;;
     amzn:*)
-      info "  Amazon Linux 2023: no fixed PHP package on 21 Oct; AWS Security Bulletin 2026-143-aws targets 22 Oct."
-      info "    Watch https://explore.alas.aws.amazon.com/CVE-2026-109618.html; keep this mitigation and the edge rules." ;;
+      info "  Amazon Linux 2: php8.2 from Extras is fixed (ALAS2PHP8.2-2026-015, 22 Oct): yum update 'php*'."
+      info "    Core php (5.4) gets no fix: move to the php8.2 extra or another host." ;;
+    fedora:*)
+      info "  Fedora: 44 has PHP 8.5.12 (FEDORA-2026-a9eba4bbc3): dnf upgrade --refresh 'php*'" ;;
+    sles:*|sled:*|opensuse*)
+      info "  SUSE / openSUSE backport into the existing version: zypper lp --cve=CVE-2026-109618, then zypper patch" ;;
     alpine:*)
       info "  Alpine: php83 8.3.36-r0, php84 8.4.27-r0, php85 8.5.12-r0 on 3.24 and edge. Older branches: check secdb.alpinelinux.org" ;;
     debian:bullseye|debian:buster) info "  Debian $(. /etc/os-release; echo "$VERSION_ID"): no free fix (LTS ended). Upgrade the OS, use packages.sury.org, or paid ELTS." ;;
   esac
   if ls -d /opt/alt/php[0-9]* >/dev/null 2>&1; then
-    info "  CloudLinux alt-php: ${pm:-dnf} upgrade 'alt-php*'   (rolling out per OS since 21 Oct; status: https://cloudlinux.statuspage.io/)"
+    info "  CloudLinux alt-php: ${pm:-dnf} clean all && ${pm:-dnf} upgrade 'alt-php*'. In CloudLinux 7 / 8 / 9 stable since 22 Oct"
+    info "    00:07 UTC (5.2-8.5); CloudLinux 10: TuxCare ELS ALT PHP repo. Status: https://cloudlinux.statuspage.io/"
   fi
   if [ -d /usr/local/lsws ]; then
     info "  LiteSpeed lsphp: update the lsphpXY packages, then: /usr/local/lsws/bin/lswsctrl restart"
@@ -703,7 +736,7 @@ update_hints() {
     if grep -rqs 'packages.sury.org' /etc/apt/sources.list /etc/apt/sources.list.d; then
       info "  packages.sury.org repository detected (gets fixes first for Debian / Ubuntu on amd64)."
       if [ "$(dpkg --print-architecture 2>/dev/null)" = arm64 ]; then
-        info "    arm64: sury's arm64 builds were still the old 8.2.34 / 8.3.35 / 8.4.26 / 8.5.11 on 21 Oct (21:20 UTC)."
+        info "    arm64: sury's arm64 builds were still the old 8.2.34 / 8.3.35 / 8.4.26 / 8.5.11 on 22 Oct."
         info "    Keep this mitigation until apt-cache policy shows 8.2.35 / 8.3.36 / 8.4.27 / 8.5.12. On Ubuntu,"
         info "    ppa:ondrej/php already has fixed arm64 builds of all four branches."
       fi
@@ -837,7 +870,7 @@ fi
 # --interim: read-only report of the interim measures in effect (php.net advisories, php2shell.uk)
 # ---------------------------------------------------------------------------
 # Directives the advisories name as partial measures, and the values they suggest
-INTERIM_KEYS="memory_limit post_max_size upload_max_filesize max_input_vars max_input_nesting_level max_file_uploads max_multipart_body_parts file_uploads display_errors ${DIRECTIVE} ${FEB}"
+INTERIM_KEYS="memory_limit post_max_size upload_max_filesize max_input_vars max_input_nesting_level max_file_uploads max_multipart_body_parts file_uploads display_errors opcache.enable ${DIRECTIVE} ${FEB}"
 if [ "$MODE" = interim ]; then
   [ "$(id -u)" -ne 0 ] && info "Not running as root: live pools and process limits are skipped."
   info "php-fix $VERSION interim measures (read-only). None of these replaces the update; see README, 'Interim measures'."
@@ -855,6 +888,10 @@ if [ "$MODE" = interim ]; then
     case ";$kv;" in *";memory_limit=-1;"*) ;; *) info "    memory_limit is finite: the advisory's OOM measure is memory_limit = -1 via php_admin_value, with a cgroup cap" ;; esac
     case ";$kv;" in *";display_errors=1;"*|*";display_errors=On;"*|*";display_errors=stdout;"*) info "    display_errors is on: turn it off in production" ;; esac
     [ "${n:-0}" = 805 ] && case ";$kv;" in *";${FEB}=1;"*) info "    ${FEB} is On: run the default mode (writes ${FEB_INI})" ;; esac
+    # Imperva (21 Oct): one of five demonstrated techniques turns an OOM bailout into a stale OPcache
+    # class-cache slot and an arbitrary file read. Not in PHP's advisory; disabling OPcache costs a lot of CPU.
+    case ";$kv;" in *";opcache.enable=1;"*|*";opcache.enable=On;"*)
+      info "    opcache.enable is on: Imperva lists opcache.enable = 0 as a temporary measure (OPcache file-read technique; heavy CPU cost)" ;; esac
     return 0
   }
   ikv_cli() {   # <binary> <sapi>: k=v;k=v for INTERIM_KEYS
@@ -919,6 +956,7 @@ if [ "$MODE" = interim ]; then
   info "Suggested values (php2shell.uk / php.net, test first; large forms and uploads may break): post_max_size 8M"
   info "  (32M with uploads), max_input_nesting_level 32, max_input_vars 1000, max_file_uploads 5,"
   info "  max_multipart_body_parts 200, display_errors Off. php-fix applies none of these by itself."
+  info "  Imperva also lists opcache.enable = 0 (one OPcache file-read technique); only where the CPU cost is acceptable."
   if [ "$BAD" -gt 0 ]; then err "$BAD setting(s) make the OOM bug easier to reach."; exit 1; fi
   ok "No RLIMIT_AS / RLIMIT_DATA limits found on PHP or web server processes."
   exit 0
@@ -933,6 +971,9 @@ if [ "$MODE" = audit ]; then
   MIN=$((AUDIT_HOURS*60)); FINDINGS=0
   flag() { err "$*"; FINDINGS=$((FINDINGS+1)); }
   info "php-fix $VERSION audit, last ${AUDIT_HOURS}h (read-only, heuristic: findings need human review)"
+  if [ "$(date -d "-$AUDIT_HOURS hours" +%s)" -gt "$(date -d "$FIRST_SEEN" +%s)" ]; then
+    info "Exploitation attempts were seen from 17 Oct 2026 on, before disclosure: --audit=exposure covers that whole window."
+  fi
   command -v ps >/dev/null 2>&1 || err "ps not found (install procps): process checks are SKIPPED"
   if [ "$OS" = FreeBSD ]; then command -v sockstat >/dev/null 2>&1 || info "sockstat not found: network check skipped"
   else command -v ss >/dev/null 2>&1 || info "ss not found (install iproute2): network check skipped"; fi
@@ -988,6 +1029,11 @@ if [ "$MODE" = audit ]; then
     c="$("${NICE[@]}" find "$d" -maxdepth 1 -type f -name 'sess_*' -mmin "-$MIN" -print0 2>/dev/null \
       | xargs -0 -r grep -ls 'upload_progress_' 2>/dev/null | wc -l | tr -d ' ')"
     [ "$c" -gt 0 ] && flag "$c recent session file(s) with upload_progress_ data in $d (feature was used; legit progress bars or probing)"
+    # Seen in the wild: PHP code planted into a session file through PHP_SESSION_UPLOAD_PROGRESS,
+    # then included via php://filter / LFI (VulnCheck, 21 Oct: <?php echo 'PWNED::'; system($_GET['c']); ?>)
+    while read -r f; do [ -n "$f" ] && flag "Session file holds PHP code (webshell planted through upload progress?): $f"; done \
+      < <("${NICE[@]}" find "$d" -maxdepth 1 -type f -name 'sess_*' -mmin "-$MIN" -print0 2>/dev/null \
+        | xargs -0 -r grep -lsE '<\?php|<\?=|PWNED::|(system|passthru|shell_exec|eval|assert)[[:space:]]*\(' 2>/dev/null | head -20)
   done
 
   # 6) Recently changed cron jobs (common persistence)
@@ -1014,6 +1060,35 @@ if [ "$MODE" = audit ]; then
       c5="$(printf '%s\n' "$MP" | awk '$9 ~ /^50[0-4]$/' | wc -l | tr -d ' ')"
       [ "$c5" -gt 0 ] && flag "$c5 multipart request(s) answered with 500-504 (worker crashes under multipart = exploitation attempts?)"
     fi
+  fi
+
+  # 7b) Published php2shell indicators in current AND rotated access logs of the window
+  #     (exploitation started 17 Oct, logs rotate daily): IOC addresses, php://filter read-backs of
+  #     planted session files, upload-progress fields in URLs, known scanner user agents and probe files.
+  ALL_LOGS=()
+  for l in /var/log/apache2/*access* /var/log/httpd/*access_log* /var/log/nginx/*access* \
+           /usr/local/apache/domlogs/*/* /var/www/vhosts/*/logs/access*log* /usr/local/lsws/logs/access.log* \
+           /www/wwwlogs/*.log*; do
+    case "$l" in *.bz2|*.xz|*.zip) continue ;; esac
+    [ -f "$l" ] && [ -n "$(find "$l" -maxdepth 0 -mmin "-$MIN" 2>/dev/null)" ] && ALL_LOGS+=("$l")
+  done
+  if [ ${#ALL_LOGS[@]} -gt 0 ]; then
+    IOC_HITS="$(for l in "${ALL_LOGS[@]}"; do "${NICE[@]}" zcat -f "$l" 2>/dev/null | tail -n 500000; done \
+      | tr -d '\000-\011\013-\037\177' | awk -v ips="$IOC_IPS" '
+        BEGIN { n = split(ips, a, /[[:space:]]+/); for (i = 1; i <= n; i++) if (a[i] != "") ioc[a[i]] = 1 }
+        { l = tolower($0)
+          if ($1 in ioc)                                  print "ip", $1
+          if (l ~ /php:(\/\/|%2f%2f)filter/)              print "filter", $1
+          if (l ~ /php_session_upload_progress/)          print "upf", $1
+          if (l ~ /php2shell-(scan|verify|poc)|\(php2shell-poc\)/) print "ua", $1
+          if (l ~ /\/php2shell-probe-/)                   print "probe", $1 }')"
+    hits() { printf '%s\n' "$IOC_HITS" | awk -v t="$1" '$1 == t {c[$2]++} END {for (k in c) printf "%s%s (%d)", (n++ ? ", " : ""), k, c[k]}'; }
+    info "Searched ${#ALL_LOGS[@]} access log(s) of the window, rotated ones included, for published php2shell indicators."
+    h="$(hits ip)";     [ -n "$h" ] && flag "Requests from published php2shell IOC addresses (shared infrastructure, investigate): $h"
+    h="$(hits filter)"; [ -n "$h" ] && flag "php://filter in request URLs (read-back of a planted session file / LFI?) from: $h"
+    h="$(hits upf)";    [ -n "$h" ] && flag "PHP_SESSION_UPLOAD_PROGRESS in request URLs from: $h"
+    h="$(hits ua)";     [ -n "$h" ] && info "php2shell scanner user agents (probing, maybe your own checks) from: $h"
+    h="$(hits probe)";  [ -n "$h" ] && info "php2shell-probe-* file requests (probing) from: $h"
   fi
 
   # 8) PHP worker crashes: memory-corruption exploits usually crash workers while they are being tuned
@@ -1080,6 +1155,14 @@ if [ "$MODE" = audit ]; then
         && err "PHP jail not covered (run php-fix --audit inside it, jexec $name): $name ($path)"
     done < <(jls jid name path 2>/dev/null)
   fi
+
+  # 14a) Persistence after a webshell: new accounts, sudo rules, SSH keys, login shells for web users
+  while read -r f; do [ -n "$f" ] && flag "Account / sudo / SSH key file changed in the window (package installs do this too): $f"; done < <(find /etc/passwd /etc/shadow \
+    /etc/group /etc/sudoers /etc/sudoers.d /root/.ssh /home/*/.ssh /var/www/.ssh -xdev -type f -mmin "-$MIN" 2>/dev/null | head -30)
+  while IFS=: read -r u _ _ _ _ home sh; do
+    case "$u" in www-data|apache|nginx|nobody|http|httpd|wwwrun|lsadm) ;; *) continue ;; esac
+    case "$sh" in */nologin|*/false|/dev/null|'') ;; *) flag "Web server user $u has a login shell: $sh (home $home)" ;; esac
+  done < /etc/passwd
 
   # 14) Per-request INI overrides (context, not a finding): applied before request startup, so any
   #     warning/deprecation they raise is a CVE-2026-109619 consumer. Move them to php.ini / the pool.

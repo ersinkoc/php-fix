@@ -59,6 +59,9 @@ cp -p "$CLI_INI" /root/cli.ini.orig
 echo "== --waf-print"
 out="$(bash $S --waf-print)"; expect_rc 0 $? "waf-print"
 echo "$out" | grep -q 'SecRule ARGS_NAMES' && pass "waf-print has ModSecurity rule" || fail "waf-print content"
+echo "$out" | sed -n '/AWS WAF/,/^$/p' | grep '^# [{ ]' | sed 's/^# //' > /tmp/aws-waf.json
+php -r 'exit(is_array(json_decode(file_get_contents("/tmp/aws-waf.json"), true)) ? 0 : 1);' && pass "waf-print AWS WAF rule is valid JSON" || fail "AWS WAF rule JSON"
+rm -f /tmp/aws-waf.json
 
 echo "== --dry-run changes nothing"
 bash $S --dry-run >/dev/null; expect_rc 0 $? "dry-run"
@@ -159,6 +162,7 @@ NGX
   bash $S --check --json | php -r '$j = json_decode(stream_get_contents(STDIN), true); exit(is_array($j) && isset($j["results"][0]["status"]) ? 0 : 1);' \
     && pass "--check --json is valid JSON" || fail "--check --json invalid"
   bash $S --interim 2>&1 | grep -q 'second @ .*(live pool).*memory_limit='     && pass "--interim reads interim settings from live pools" || fail "--interim live pools"
+  bash $S --interim 2>&1 | grep -q 'second @ .*(live pool).*opcache\.enable='  && pass "--interim reports opcache.enable per live pool" || fail "--interim opcache.enable"
   rm -f "$POOL3"
 
   echo "== --check after a package update"
@@ -214,6 +218,24 @@ ALOG=/var/log/apache2/test-access.log; [ -d /var/log/apache2 ] || ALOG=/var/log/
 echo '198.51.100.9 - - [21/Oct/2026:09:00:00 +0000] "POST /index.php HTTP/1.1" 502 0 "-" "x" ct="multipart/form-data; boundary=z"' > "$ALOG"
 bash $S --audit 2>&1 | grep -q 'multipart request(s) answered with 500-504' && pass "audit flags multipart 5xx from Content-Type logs" || fail "audit missed multipart 5xx"
 rm -f "$ALOG"
+
+echo "== --audit: published indicators in rotated logs, session-file webshell, exposure window"
+# rotated + gzipped log with a php://filter read-back from a published IOC address and a scanner UA (inert text)
+printf '%s\n' '221.14.159.134 - - [21/Oct/2026:17:23:00 +0000] "GET /download.php?file=php://filter/convert.base64-encode/resource=/var/lib/php/sessions/sess_x HTTP/1.1" 404 0 "-" "-"' \
+  '198.51.100.20 - - [21/Oct/2026:17:30:00 +0000] "POST /index.php HTTP/1.1" 200 5 "-" "php2shell-scan/109618"' | gzip > "$ALOG.2.gz"
+cat > /tmp/sess_phpfixtest <<'SESS'
+x|s:44:"<?php echo 'PWNED::'; system($_GET['c']); ?>";
+SESS
+out="$(bash $S --audit 2>&1)"; rc=$?
+expect_rc 3 "$rc" "audit flags published indicators"
+echo "$out" | grep -q 'IOC addresses .*221\.14\.159\.134 (1)' && pass "audit flags an IOC address in a rotated .gz log" || fail "audit missed IOC address in rotated log"
+echo "$out" | grep -q 'php://filter in request URLs .*221\.14\.159\.134' && pass "audit flags php://filter read-back" || fail "audit missed php://filter"
+echo "$out" | grep -q 'scanner user agents .*198\.51\.100\.20 (1)' && pass "audit reports php2shell scanner UA" || fail "audit missed scanner UA"
+echo "$out" | grep -q 'Session file holds PHP code .*/tmp/sess_phpfixtest' && pass "audit flags a session-file webshell" || fail "audit missed session-file webshell"
+echo "$out" | grep -q 'audit=exposure covers' && pass "48 h audit points to --audit=exposure" || fail "no exposure hint"
+bash $S --audit=exposure 2>&1 | grep -qE 'audit, last [0-9]+h' && pass "--audit=exposure computes the window" || fail "--audit=exposure"
+bash $S --audit=exposure 2>&1 | grep -q 'audit=exposure covers' && fail "exposure window still hints at itself" || pass "exposure window reaches 17 Oct"
+rm -f "$ALOG.2.gz" /tmp/sess_phpfixtest
 
 echo "== --audit output cannot carry terminal escapes"
 evil="/var/www/html/$(printf 'x\033[2J\033[1A[OK] clean')"
