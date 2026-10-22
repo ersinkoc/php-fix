@@ -9,6 +9,7 @@
 #   ... | sudo bash -s -- --no-restart   # do not reload PHP / web services
 #   ... | sudo bash -s -- --check        # read-only: patched / unpatched / EOL per PHP binary
 #   ... | sudo bash -s -- --audit        # read-only: quick indicator-of-compromise sweep
+#   ... | sudo bash -s -- --interim      # read-only: which interim measures are in effect, and what makes it worse
 #   ... | bash -s -- --waf-print         # print WAF / proxy rules for the multipart path, change nothing
 #   ... | sudo bash -s -- --revert       # restore the backups of the last run
 #   ... | bash -s -- --probe=https://example.com/index.php   # check from outside that multipart is blocked
@@ -23,7 +24,7 @@ OS="$(uname -s)"
 case ":$PATH:" in *:/usr/local/sbin:*) ;; *) PATH="$PATH:/usr/local/sbin" ;; esac
 case ":$PATH:" in *:/usr/local/bin:*) ;; *) PATH="$PATH:/usr/local/bin" ;; esac
 
-VERSION="1.11.1"
+VERSION="1.12.0"
 DIRECTIVE="session.upload_progress.enabled"
 TS="$(date +%Y%m%d-%H%M%S)"
 MODE=fix
@@ -59,6 +60,8 @@ Usage: install.sh [mode] [options]
 Modes (default: apply the mitigation):
   --check            Read-only. Report patched / unpatched / EOL for every PHP binary.
   --audit[=HOURS]    Read-only. Quick indicator-of-compromise sweep (default: last 48 h).
+  --interim          Read-only. Which interim measures are in effect per FPM binary / live pool,
+                     and settings that make the OOM bug easier to reach (RLIMIT_AS / RLIMIT_DATA).
   --waf-print        Print WAF / proxy rules for the multipart path. Changes nothing.
   --revert[=STAMP]   Restore the backups of the last run (or of run STAMP, e.g. 20261021-120000).
   --probe=URL        From outside: does multipart still reach this PHP URL? (5 harmless requests)
@@ -80,6 +83,7 @@ for arg in "$@"; do
     --audit)      MODE=audit ;;
     --audit=*)    MODE=audit; AUDIT_HOURS="${arg#*=}" ;;
     --waf-print)  MODE=waf ;;
+    --interim)    MODE=interim ;;
     --revert)     MODE=revert ;;
     --revert=*)   MODE=revert; REVERT_TS="${arg#*=}" ;;
     --probe=*)    MODE=probe; PROBE_URL="${arg#*=}" ;;
@@ -489,14 +493,15 @@ find_pool_files() {
 }
 
 # prints "<pool>|<address>|<PHP_VERSION>|<value>" or "<pool>|<address>|ERR|<reason>"
+# fcgi_pools [PHP expression]: report that expression instead of the directive's value
 fcgi_pools() {
   [ "$(id -u)" -eq 0 ] || return 0
-  local cli dir pool addr out f
+  local cli dir pool addr out f expr="${1:-ini_get('${DIRECTIVE}')}"
   cli="$(find_php_bins | head -1)"; [ -n "$cli" ] || return 0
   dir="$RUN_BASE/php-fix.$$"
   mkdir -m 755 "$dir" 2>/dev/null || return 0
   printf '%s' "$FCGI_CLIENT" > "$dir/client.php"
-  echo "<?php echo 'PHPFIX:'.PHP_VERSION.'|'.ini_get('${DIRECTIVE}');" > "$dir/check.php"
+  echo "<?php echo 'PHPFIX:'.PHP_VERSION.'|'.${expr};" > "$dir/check.php"
   chmod 644 "$dir/check.php"
   while read -r f; do
     awk -F'=' '/^[[:space:]]*\[.+\][[:space:]]*$/ { pool=$0; gsub(/[[:space:]]/, "", pool); gsub(/^\[|\]$/, "", pool) }
@@ -826,6 +831,97 @@ if [ "$MODE" = check ]; then
     printf ']}\n'
   fi
   exit "$UNPATCHED"
+fi
+
+# ---------------------------------------------------------------------------
+# --interim: read-only report of the interim measures in effect (php.net advisories, php2shell.uk)
+# ---------------------------------------------------------------------------
+# Directives the advisories name as partial measures, and the values they suggest
+INTERIM_KEYS="memory_limit post_max_size upload_max_filesize max_input_vars max_input_nesting_level max_file_uploads max_multipart_body_parts file_uploads display_errors ${DIRECTIVE} ${FEB}"
+if [ "$MODE" = interim ]; then
+  [ "$(id -u)" -ne 0 ] && info "Not running as root: live pools and process limits are skipped."
+  info "php-fix $VERSION interim measures (read-only). None of these replaces the update; see README, 'Interim measures'."
+  BAD=0
+  bad() { err "$*"; BAD=$((BAD+1)); }
+  # memory_limit=-1 is the advisory's main OOM measure, safe only with a cgroup memory cap
+  interim_line() {   # <label> <PHP_VERSION> <k=v;k=v...> [binary]
+    local label="$1" ver="$2" kv="$3" st="" n
+    kv="${kv%;"${FEB}"=}"   # unknown before PHP 8.5
+    classify "$ver" off "${4:-}"
+    [ "$STATUS" = PATCHED ] && st=" (patched build: interim measures can be undone)"
+    info "$label (PHP $ver)$st: ${kv//;/  }"
+    n="$(branch_num "$ver")"
+    [ "$STATUS" = PATCHED ] && return 0
+    case ";$kv;" in *";memory_limit=-1;"*) ;; *) info "    memory_limit is finite: the advisory's OOM measure is memory_limit = -1 via php_admin_value, with a cgroup cap" ;; esac
+    case ";$kv;" in *";display_errors=1;"*|*";display_errors=On;"*|*";display_errors=stdout;"*) info "    display_errors is on: turn it off in production" ;; esac
+    [ "${n:-0}" = 805 ] && case ";$kv;" in *";${FEB}=1;"*) info "    ${FEB} is On: run the default mode (writes ${FEB_INI})" ;; esac
+    return 0
+  }
+  ikv_cli() {   # <binary> <sapi>: k=v;k=v for INTERIM_KEYS
+    local b="$1" sapi="$2" k out=""
+    for k in $INTERIM_KEYS; do out="$out;$k=$(ini_val "$b" "$sapi" "$k")"; done
+    echo "${out#;}"
+  }
+  while IFS='|' read -r b sapi ver _; do
+    [ "$sapi" = fpm ] || continue
+    interim_line "$b (fpm binary, php.ini only)" "$ver" "$(ikv_cli "$b" fpm)" "$b"
+  done < <(collect_bins)
+  # What each running pool really applies (pool php_admin_* included)
+  expr="implode(';', array_map(function(\$k){ return \$k.'='.ini_get(\$k); }, explode(' ', '${INTERIM_KEYS}')))"
+  while IFS='|' read -r pool addr ver kv; do
+    if [ "$ver" = ERR ]; then info "$pool @ $addr: $kv"; continue; fi
+    interim_line "$pool @ $addr (live pool)" "$ver" "$kv"
+  done < <(fcgi_pools "$expr")
+
+  # Pool recycling (pm.max_requests): partial for CVE-2026-109619, costs a fork per N requests
+  while read -r f; do
+    m="$(grep -hE '^[[:space:]]*pm\.max_requests[[:space:]]*=' "$f" 2>/dev/null | tail -1 | sed -E 's/.*=[[:space:]]*//')"
+    info "FPM pool file $f: pm.max_requests = ${m:-0 (never recycle)}"
+  done < <(find_pool_files)
+
+  # Process limits: RLIMIT_AS / RLIMIT_DATA make allocations fail inside PHP = the vulnerable OOM path.
+  # A cgroup memory cap (memory.max) is what the advisory recommends instead.
+  while read -r pd; do
+    c="$(cat "$pd/comm" 2>/dev/null)" || continue
+    case "$c" in php*|lsphp*|apache2|httpd|frankenphp|litespeed|lshttpd) ;; *) continue ;; esac
+    pp="$(awk '{print $4}' "$pd/stat" 2>/dev/null)"
+    # masters only: workers inherit the same limits and cgroup
+    [ "$pp" = 1 ] || [ "$(cat "/proc/$pp/comm" 2>/dev/null)" != "$c" ] || continue
+    lim="$(awk '/^Max (address space|data size)/ && $4 != "unlimited" {printf "%s%s %s %s = %s", (n++?", ":""), $1, $2, $3, $4}' "$pd/limits" 2>/dev/null)"
+    [ -n "$lim" ] && bad "$c (pid ${pd#/proc/}) runs with ${lim} bytes: RLIMIT_AS / RLIMIT_DATA make the OOM bug easier to reach. Remove it (systemd LimitAS= / LimitDATA=, ulimit -v / -d) and use a cgroup cap (MemoryMax=) instead."
+    cg="$(awk -F: '$1 == "0" {print $3}' "$pd/cgroup" 2>/dev/null)"
+    if [ -n "$cg" ] && [ -r "/sys/fs/cgroup$cg/memory.max" ]; then
+      mm="$(cat "/sys/fs/cgroup$cg/memory.max")"
+      case "$mm" in max) mm="none" ;; *[!0-9]*|'') ;; *) mm="$((mm/1048576)) MiB" ;; esac
+      info "$c (pid ${pd#/proc/}) cgroup memory cap: $mm  ($cg)"
+    fi
+  done < <(ls -d /proc/[0-9]* 2>/dev/null)
+
+  # The same limits set in config, for services not running right now
+  for f in /etc/systemd/system/*.service.d/*.conf /etc/systemd/system/*.service /lib/systemd/system/*.service /usr/lib/systemd/system/*.service; do
+    [ -f "$f" ] || continue
+    case "$f" in *php*|*apache*|*httpd*|*lsws*|*litespeed*) ;; *) continue ;; esac
+    while read -r l; do bad "systemd $l: use MemoryMax= instead (RLIMIT_AS / RLIMIT_DATA hit the vulnerable OOM path)"; done \
+      < <(grep -HE '^[[:space:]]*Limit(AS|DATA)=' "$f" 2>/dev/null | grep -Eiv '=[[:space:]]*(infinity)?[[:space:]]*$')
+  done
+  while read -r l; do bad "$l: ulimit -v / -d set RLIMIT_AS / RLIMIT_DATA; use a cgroup cap instead"; done \
+    < <(grep -rsHE '^[[:space:]]*ulimit[[:space:]]+(-[a-zA-Z]*[vd])' /etc/default /etc/sysconfig 2>/dev/null | grep -Ei 'php|apache|httpd|lsws')
+  while read -r l; do bad "Apache $l: RLimitMEM sets RLIMIT_DATA / RLIMIT_AS for CGI children; use a cgroup cap instead"; done \
+    < <(grep -rsHiE '^[[:space:]]*RLimitMEM[[:space:]]' /etc/apache2 /etc/httpd /usr/local/apache/conf 2>/dev/null)
+
+  # Body caps at the web server (the advisory: enforce request size limits before PHP)
+  b="$(grep -rshE '^[[:space:]]*client_max_body_size[[:space:]]' /etc/nginx 2>/dev/null | sed -E 's/^[[:space:]]+//; s/[[:space:]]*;.*//' | sort | uniq -c | sed -E 's/^ +//' | paste -sd, -)"
+  [ -d /etc/nginx ] && info "nginx client_max_body_size: ${b:-not set (nginx default 1m)}"
+  b="$(grep -rshiE '^[[:space:]]*LimitRequestBody[[:space:]]' /etc/apache2 /etc/httpd /usr/local/apache/conf 2>/dev/null | sed -E 's/^[[:space:]]+//' | sort | uniq -c | sed -E 's/^ +//' | paste -sd, -)"
+  { [ -d /etc/apache2 ] || [ -d /etc/httpd ]; } && info "Apache LimitRequestBody: ${b:-not set (Apache 2.4.54+ default 1 GiB)}"
+
+  echo
+  info "Suggested values (php2shell.uk / php.net, test first; large forms and uploads may break): post_max_size 8M"
+  info "  (32M with uploads), max_input_nesting_level 32, max_input_vars 1000, max_file_uploads 5,"
+  info "  max_multipart_body_parts 200, display_errors Off. php-fix applies none of these by itself."
+  if [ "$BAD" -gt 0 ]; then err "$BAD setting(s) make the OOM bug easier to reach."; exit 1; fi
+  ok "No RLIMIT_AS / RLIMIT_DATA limits found on PHP or web server processes."
+  exit 0
 fi
 
 # ---------------------------------------------------------------------------

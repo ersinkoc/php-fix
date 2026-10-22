@@ -158,6 +158,7 @@ NGX
   bash $S --check 2>&1 | grep -q 'third @ 127.0.0.1:9123 (fpm-pool .*mitigation off' && pass "live check catches a pool forcing it On (TCP listener)" || fail "live check missed pool forcing On"
   bash $S --check --json | php -r '$j = json_decode(stream_get_contents(STDIN), true); exit(is_array($j) && isset($j["results"][0]["status"]) ? 0 : 1);' \
     && pass "--check --json is valid JSON" || fail "--check --json invalid"
+  bash $S --interim 2>&1 | grep -q 'second @ .*(live pool).*memory_limit='     && pass "--interim reads interim settings from live pools" || fail "--interim live pools"
   rm -f "$POOL3"
 
   echo "== --check after a package update"
@@ -171,6 +172,20 @@ NGX
   rm -f /root/fpm.new
   nginx -s stop; pkill -f php-fpm; sleep 1
   rm -f /var/www/html/.user.ini /etc/nginx/conf.d/php2shell.conf
+fi
+
+echo "== --interim: RLIMIT_AS / RLIMIT_DATA on PHP processes, RLimitMEM in Apache"
+bash $S --interim >/dev/null 2>&1; expect_rc 0 $? "--interim on a host without address-space limits"
+cp "$(command -v sleep)" /tmp/php-fpm-limtest
+prlimit --as=8000000000 /tmp/php-fpm-limtest 60 & LP=$!; sleep 1
+out="$(bash $S --interim 2>&1)"; rc=$?
+echo "$out" | grep -q "php-fpm-limtest (pid $LP) runs with Max address space = 8000000000" && [ "$rc" = 1 ]   && pass "--interim flags a PHP process with RLIMIT_AS (rc=$rc)" || fail "--interim missed RLIMIT_AS (rc=$rc)"
+kill "$LP" 2>/dev/null; wait "$LP" 2>/dev/null; rm -f /tmp/php-fpm-limtest
+AD=/etc/apache2/conf-enabled; [ -d "$AD" ] || AD=/etc/httpd/conf.d
+if [ -d "$AD" ]; then
+  echo 'RLimitMEM 500000000' > "$AD/zz-rlimtest.conf"
+  bash $S --interim 2>&1 | grep -q 'RLimitMEM sets RLIMIT_DATA' && pass "--interim flags Apache RLimitMEM" || fail "--interim missed RLimitMEM"
+  rm -f "$AD/zz-rlimtest.conf"
 fi
 
 echo "== --check"
