@@ -164,6 +164,13 @@ NGX
   bash $S --interim 2>&1 | grep -q 'second @ .*(live pool).*memory_limit='     && pass "--interim reads interim settings from live pools" || fail "--interim live pools"
   bash $S --interim 2>&1 | grep -q 'second @ .*(live pool).*opcache\.enable='  && pass "--interim reports opcache.enable per live pool" || fail "--interim opcache.enable"
   rm -f "$POOL3"
+  # php-fpm expands $pool in listen (Plesk / panel-style pools), and values may be quoted
+  POOL4="$(dirname "$POOL2")/fourth.conf"
+  printf '[fourth]\nuser = %s\ngroup = %s\nlisten = "%s/$pool.sock"\nlisten.owner = %s\npm = ondemand\npm.max_children = 2\n' \
+    "$WEBUSER" "$WEBUSER" "$(dirname "$SOCK2")" "$WEBUSER" > "$POOL4"
+  pkill -f php-fpm; sleep 1; "$FPMBIN" -D; sleep 1
+  bash $S --check 2>&1 | grep -q "fourth @ $(dirname "$SOCK2")/fourth.sock (fpm-pool " && pass "live check expands \$pool in a quoted listen path" || fail "live check \$pool listen"
+  rm -f "$POOL4"
 
   echo "== --check after a package update"
   # Simulate an update: the binary is replaced on disk while the old master keeps running
@@ -236,6 +243,17 @@ echo "$out" | grep -q 'audit=exposure covers' && pass "48 h audit points to --au
 bash $S --audit=exposure 2>&1 | grep -qE 'audit, last [0-9]+h' && pass "--audit=exposure computes the window" || fail "--audit=exposure"
 bash $S --audit=exposure 2>&1 | grep -q 'audit=exposure covers' && fail "exposure window still hints at itself" || pass "exposure window reaches 17 Oct"
 rm -f "$ALOG.2.gz" /tmp/sess_phpfixtest
+
+echo "== --audit: disguised webshells (double extension, image polyglot)"
+mkdir -p /var/www/html/uploads
+printf 'GIF89a<?php echo 1; ?>' > /var/www/html/uploads/avatar.gif         # inert polyglot fixture
+printf 'GIF89a' > /var/www/html/uploads/clean.gif
+echo '<?php echo 1;' > /var/www/html/uploads/avatar.php.jpg
+out="$(bash $S --audit 2>&1)"
+echo "$out" | grep -q 'Image file containing PHP code .*/uploads/avatar.gif' && pass "audit flags an image polyglot" || fail "audit missed image polyglot"
+echo "$out" | grep -q 'clean.gif' && fail "audit flagged a clean image" || pass "clean image not flagged"
+echo "$out" | grep -q 'Double-extension PHP file .*/uploads/avatar.php.jpg' && pass "audit flags a double-extension file" || fail "audit missed double extension"
+rm -rf /var/www/html/uploads
 
 echo "== --audit output cannot carry terminal escapes"
 evil="/var/www/html/$(printf 'x\033[2J\033[1A[OK] clean')"

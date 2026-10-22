@@ -9,7 +9,9 @@ One-line emergency mitigation for **php2shell** (**CVE-2026-109618** / **CVE-202
 > The PHP team says updating is the only complete mitigation. This script is for the time until you can.
 
 > [!WARNING]
-> **Attacks started before disclosure.** Amazon's MadPot honeypots saw the first exploitation attempt on **17 October 2026**, four days before the patch. More followed on 21 October, seen by Amazon, Cloudflare, watchTowr and VulnCheck. One attempt planted a webshell into a session file through `PHP_SESSION_UPLOAD_PROGRESS`. VulnCheck reports a weaponized CVE-2026-109618 exploit working against PHP 8.4.26 on x86-64 **with ASLR on and `display_errors=Off`**. On ARM64 only the memory leak works so far. CISA's KEV catalog still didn't list the CVEs on 22 October (catalog 2026.10.21). Some public "PoCs" are unverified and may carry malware (Tenable), so don't run them on your own machines. CERT-EU (SA 2026-018) and the UK NCSC advise taking internet-facing PHP offline if you can't patch now.
+> **Attacks started before disclosure.** Amazon's MadPot honeypots saw the first exploitation attempt on **17 October 2026**, four days before the patch. More followed on 21 October, seen by Amazon, Cloudflare, watchTowr and VulnCheck. One attempt planted a webshell into a session file through `PHP_SESSION_UPLOAD_PROGRESS`. VulnCheck reports a weaponized CVE-2026-109618 exploit working against PHP 8.4.26 on x86-64 **with ASLR on and `display_errors=Off`**. On ARM64 only the memory leak works so far. Cloudflare counted thousands of attempts in the 10 hours before the announcement and hundreds of thousands within 2 hours after; on 22 October its CEO put the total in the millions. Amazon calls it "broadly exploited in the wild". No successful compromise has been confirmed publicly yet. CISA's KEV catalog still didn't list the CVEs on 22 October (catalog 2026.10.21).
+>
+> **Don't run public "PoCs".** watchTowr says none of the mass-sprayed ones achieve RCE: they fail, measure timing or crash the target. JFrog and AhnLab found fake repositories, including one that runs a hidden encoded payload, and fake exploits aimed at security researchers have shipped malware before. CERT-EU (SA 2026-018) and the UK NCSC advise taking internet-facing PHP offline if you can't patch now.
 >
 > **Investigate from 17 October, not from the disclosure date:** `--audit=exposure` covers that whole window. See [Published indicators](#published-indicators-iocs).
 
@@ -46,7 +48,7 @@ curl -fsSL https://raw.githubusercontent.com/ersinkoc/php-fix/main/install.sh | 
 Piping `main` into `sudo bash` means trusting whatever is on `main` at that moment. For production, use a release instead. Every release is built by GitHub Actions and ships with a `SHA256SUMS` file and a signed [build provenance attestation](https://docs.github.com/actions/security-for-github-actions/using-artifact-attestations):
 
 ```bash
-V=v1.13.0
+V=v1.14.0
 curl -fsSLO https://github.com/ersinkoc/php-fix/releases/download/$V/install.sh
 curl -fsSLO https://github.com/ersinkoc/php-fix/releases/download/$V/SHA256SUMS
 sha256sum -c SHA256SUMS                                      # integrity
@@ -126,6 +128,7 @@ This is a heuristic sweep, not proof either way. Every finding needs a human to 
 
 - PHP / `.htaccess` / `.user.ini` files changed in web roots within the window (listed for review; CMS updates are normal noise)
 - Webshell-like code in those files (`eval(base64_decode(...))`, `system($_POST...)`, and similar)
+- **Disguised webshells** written in the window (Elastic): double extensions (`avatar.php.jpg`, `x.phtml.png`) and images that carry PHP code (polyglots: `GIF89a<?php …`)
 - `.htaccess` / `.user.ini` files that turn upload progress back on
 - Shells or interpreters (`sh`, `bash`, `nc`, `python`, `perl`, `curl`, `wget`, …) whose parent is PHP or the web server. Some are legitimate, e.g. `mail()` calling `sh -c sendmail`.
 - Session files containing `upload_progress_` data, meaning the vulnerable code path was exercised
@@ -195,7 +198,7 @@ The tests cover:
   - the allowlisted path, urlencoded POSTs and JSON POSTs pass
   - on Apache: a subfolder `.htaccess` with `RewriteEngine On` + `Require all granted` cannot bypass the rule, and neither can a vhost with its own rewrite rules
 - **Live pool verification:**
-  - `--check` and the fix itself read the live value from running FPM pools over FastCGI, over a unix socket and over TCP
+  - `--check` and the fix itself read the live value from running FPM pools over FastCGI, over a unix socket and over TCP, including a quoted `listen = ".../$pool.sock"` path (php-fpm expands `$pool`)
   - a pool added later with `php_admin_value[…] = 1` is reported as mitigation off
   - `--check --json` produces valid JSON
 - **`--probe`:** reports `0` (blocked) against Apache with the rule, and `1` (reaches PHP) without it
@@ -209,6 +212,7 @@ The tests cover:
 - **After an update:** `--check` reports FPM workers still running a replaced binary, prints update and restart hints, and stops reporting once FPM is restarted. It warns about `memory_limit = -1` left on a patched FPM, but not on CLI, where `-1` is the default
 - **`--audit` and `--check`:**
   - `--audit` flags a planted webshell, a worker `SIGSEGV` log line, a PHP file in `/tmp`, a reverse-shell command line, and a multipart request answered with `502` in a `Content-Type`-logging access log
+  - `--audit` flags an image polyglot (`GIF89a<?php`) and an `avatar.php.jpg`, and leaves a clean image alone
   - `--audit` finds a published IOC address and a `php://filter` read-back in a **rotated, gzipped** access log, reports a `php2shell-scan` user agent, and flags a session file carrying a `PWNED::` webshell. `--audit=exposure` computes the window back to 17 Oct
   - `--audit` output stays clean when file names carry terminal escapes (ESC, 8-bit and UTF-8 C1)
   - `--check` runs; the EOL warning and the `< 5.4` exit `2` path are tested with stub binaries
@@ -288,7 +292,7 @@ This changes hour by hour. Check the vendor's page, then confirm with `--check`.
 | **Imunify360** WAF (cPanel, Plesk, CloudLinux) | ModSecurity vendor rules | ✅ ruleset **8.83** blocks the public exploit shape on Apache; **8.84 / 8.85 also block on LiteSpeed**. Scanning IPs get a CAPTCHA. Interim only | `imunify360-agent update --force modsec-rules`. `--check` reports the installed ruleset version |
 | **Cloudflare** WAF | edge | ✅ temporary rules for the known exploit vectors, for all plans including Free. Only covers traffic that goes through Cloudflare; the CTO calls it "a STOPGAP only" | nothing to do; lock the origin to Cloudflare IPs, or the rules can be bypassed |
 | **Check Point** IPS / WAF | gateway | ✅ IPS protection CPAI-2026-15172 | set new critical protections to Prevent. TLS traffic must be inspected |
-| **packages.sury.org** (Debian 12/13, Ubuntu 22.04/24.04) | `/etc/php/X.Y` | ✅ 8.2–8.5 on amd64. ⏳ **arm64 still on the old builds** (checked again on 22 Oct: bookworm arm64 8.2.34 / 8.3.35 / 8.4.26 / 8.5.11). `--check` warns on arm64 hosts | `apt-get install --only-upgrade 'php8.3*'`. On arm64, check `apt-cache policy php8.3` |
+| **packages.sury.org** (Debian 12/13, Ubuntu 22.04/24.04) | `/etc/php/X.Y` | ✅ 8.2–8.5 on amd64. ⏳ **arm64 still on the old builds** (checked twice on 22 Oct, bookworm and trixie arm64: 8.2.34 / 8.3.35 / 8.4.26 / 8.5.11). `--check` warns on arm64 hosts | `apt-get install --only-upgrade 'php8.3*'`. On arm64, check `apt-cache policy php8.3` |
 | **ppa:ondrej/php** (Launchpad) | `/etc/php/X.Y` | ✅ 8.2–8.5 on amd64 and arm64 (arm64 8.5 since 21:22 UTC) | `apt upgrade`. Ubuntu on arm64: this is the fixed source while sury's arm64 lags |
 | **Ubuntu** own packages | `/etc/php/X.Y` | ✅ every release, including ESM ([USN-8948-1 / -2](https://ubuntu.com/blog/php2shell-vulnerability-fixes-available)). See [Ubuntu](#ubuntu) below | `apt upgrade` |
 | **Debian** own packages | `/etc/php/X.Y` | ✅ 13 trixie `8.4.27-1~deb13u1` ([DSA-6574-1](https://security-tracker.debian.org/tracker/CVE-2026-109618)), ✅ 12 bookworm `8.2.35-1~deb12u1` (DLA-4848-1), ✅ sid `8.4.27-1`. ⏳ forky (testing) still `8.4.26-1`. 11: no free fix | `apt upgrade` |
@@ -297,6 +301,7 @@ This changes hour by hour. Check the vendor's page, then confirm with `--check`.
 | **Amazon Linux** | `/etc/php.ini` | ✅ AL2023 since 22 Oct: php8.2 ALAS2023-2026-3301, php8.3 -3302, php8.4 -3303, php8.5 -3304 ([ALAS](https://explore.alas.aws.amazon.com/CVE-2026-109618.html)). ❌ AL2023 php8.1: no fix planned. ✅ AL2 Extras php8.2 (ALAS2PHP8.2-2026-015); AL2 core php: no fix planned. Elastic Beanstalk PHP platform v4.13.12 carried settings only; a release with the upstream fix was targeted for 22 Oct. **Lightsail** instances can't be updated in place: create a new one from the updated blueprint | AL2023: `dnf check-release-update`, then `dnf upgrade --releasever=latest`. AL2: `yum update 'php*'` |
 | **Alpine** | `/etc/php8X` | ✅ 3.24 and edge (x86_64, aarch64): php83 `8.3.36-r0`, php84 `8.4.27-r0`, php85 `8.5.12-r0` ([secdb](https://secdb.alpinelinux.org/)). ❌ 3.23 and older won't get a fix (Alpine developer) | `apk upgrade`; on 3.23 and older, move to 3.24 |
 | **Remi** | `/etc/opt/remi`, `/opt/remi` | ✅ 8.2.35 / 8.3.36 / 8.4.27 / 8.5.12 on rpms.remirepo.net (21 Oct, evening). Some mirrors lag. The earlier 8.4.27RC1 / 8.5.12RC1 builds do **not** contain the fix | `dnf clean metadata && dnf upgrade 'php*'` (SCL: `'php8[0-9]-*'`) |
+| **LiteSpeed lsphp** (LiteSpeed repo, CyberPanel) | `/usr/local/lsws/lsphpXY` | ⏳ no fixed lsphp build confirmed on 22 Oct ([OpenLiteSpeed #532](https://github.com/litespeedtech/openlitespeed/issues/532)). `apt upgrade 'php*'` doesn't touch lsphp | `apt-get install --only-upgrade 'lsphp*'` / `dnf upgrade 'lsphp*'`, check the version, then `lswsctrl restart` |
 | **Docker `php` image** | inside the image | ✅ `8.2.35`, `8.3.36`, `8.4.27`, `8.5.12` tags on Docker Hub (from 21 Oct, ~17:30 UTC). `*RC1` tags don't contain the fix | `docker build --pull`, then `docker compose up -d --force-recreate`. Check with `docker run --rm php:8.4-fpm php -v` |
 | Gentoo / Arch / Homebrew / windows.php.net | — | ✅ (Arch: 8.3, 8.5 only) | package manager / download |
 | FrankenPHP, Chainguard images, Bref, Heroku | — | ✅ (FrankenPHP v1.13.2) | update the binary / image / buildpack |
@@ -497,7 +502,14 @@ Before you switch on blocking:
 | [Censys query gist](https://gist.github.com/silascutler/c7f04537a79ace89569f979d964af0f9) | Finding exposed PHP hosts |
 | [Vincent Schmalbach's write-up](https://www.vincentschmalbach.com/cve-2026-109618-and-cve-2026-109619-what-you-should-do-now/) | Container-tested rules for nginx, Apache, LiteSpeed, Caddy, FrankenPHP, HAProxy and Cloudflare, plus a list of what doesn't help |
 
-Timeline note: the fix and advisories are public, so the patch diff now shows attackers where the bugs are. Expect mass exploitation. Patch first, then run `--audit`.
+Timeline note: the fix and advisories are public, so the patch diff now shows attackers where the bugs are, and mass scanning is under way. Patch first, then run `--audit=exposure`.
+
+**Hunting with your own EDR / SIEM** ([Elastic's write-up](https://www.elastic.co/security-labs/threat-command/php2shell-php-rce-detection) has ready queries):
+- a non-interactive web or PHP process (`apache2`, `httpd`, `php-fpm*`, `php-cgi`, `lsphp*`, `frankenphp`) starting `sh -c` / `bash -c`
+- recon commands run as the web user: `id`, `whoami`, `uname -a`, `hostname`, `sudo -l`, `find / -perm -u=s`
+- `curl … | sh`, `wget -qO- … | sh`, `base64 -d | sh`
+- reads of `.env`, `~/.aws/credentials` and Kubernetes service account tokens, or calls to `169.254.169.254`
+- new high-entropy `.php` files under the web root
 
 ## References
 
@@ -548,6 +560,13 @@ Timeline note: the fix and advisories are public, so the patch diff now shows at
 - [RHSA-2026:87079: php:8.3 on RHEL 9](https://access.redhat.com/errata/RHSA-2026:87079)
 - [watchTowr: PHP2Shell exploited](https://watchtowr.com/intelligence/php-remote-code-execution-php2shell/)
 - [Fedora 44: FEDORA-2026-a9eba4bbc3](https://linuxsecurity.com/advisories/fedora/fedora-44-php-2026-a9eba4bbc3)
+- [SecurityWeek: exploitation started days before patches (Cloudflare volumes)](https://www.securityweek.com/php2shell-exploitation-started-days-before-patches/)
+- [Elastic Security Labs: detection coverage and hunting queries](https://www.elastic.co/security-labs/threat-command/php2shell-php-rce-detection)
+- [Recorded Future: exploitation and PoC landscape](https://www.recordedfuture.com/blog/php2shell-vulnerability-exploitation)
+- [JFrog: all you need to know (fake PoCs)](https://research.jfrog.com/post/php2shell-all-you-need-to-know-about-cve-2026-109618-and-cve-2026-109619/)
+- [AhnLab ASEC: php2shell repositories on GitHub](https://asec.ahnlab.com/en/95944/)
+- [Patchstack: attacks ongoing](https://patchstack.com/articles/php-major-vulnerability-alert-10-2026/)
+- [OpenLiteSpeed issue #532](https://github.com/litespeedtech/openlitespeed/issues/532)
 
 ## License
 

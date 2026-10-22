@@ -20,7 +20,7 @@
 
 set -u
 
-VERSION="1.13.0"
+VERSION="1.14.0"
 DIRECTIVE="session.upload_progress.enabled"
 TS="$(date +%Y%m%d-%H%M%S)"
 MODE=fix
@@ -475,8 +475,12 @@ fcgi_pools() {
   echo "<?php echo 'PHPFIX:'.PHP_VERSION.'|'.${expr};" > "$dir/check.php"
   chmod 644 "$dir/check.php"
   while read -r f; do
+    # php-fpm expands $pool in any directive (listen = /run/php/$pool.sock) and accepts quoted values
     awk -F'=' '/^[[:space:]]*\[[^]]+\][[:space:]]*$/ { gsub(/[][[:space:]]/, ""); pool=$0 }
-               /^[[:space:]]*listen[[:space:]]*=/ && pool != "global" { v=$2; gsub(/^[[:space:]]+|[[:space:]]+$/, "", v); print pool "|" v }' "$f"
+               /^[[:space:]]*listen[[:space:]]*=/ && pool != "global" {
+                 v=$2; gsub(/^[[:space:]]+|[[:space:]]+$/, "", v); gsub(/^"|"$/, "", v)
+                 while ((i = index(v, "$pool")) > 0) v = substr(v, 1, i - 1) pool substr(v, i + 5)
+                 print pool "|" v }' "$f"
   done < <(find_pool_files) | sort -u | while IFS='|' read -r pool addr; do
     case "$addr" in
       /*)          [ -S "$addr" ] || { echo "$pool|$addr|ERR|not running"; continue; } ;;
@@ -652,7 +656,9 @@ update_hints() {
     info "    00:07 UTC (5.2-8.5); CloudLinux 10: TuxCare ELS ALT PHP repo. Status: https://cloudlinux.statuspage.io/"
   fi
   if [ -d /usr/local/lsws ]; then
-    info "  LiteSpeed lsphp: update the lsphpXY packages, then: /usr/local/lsws/bin/lswsctrl restart"
+    case "$pm" in apt) info "  LiteSpeed lsphp (LiteSpeed repo, not the OS php packages): apt-get update && apt-get install --only-upgrade 'lsphp*'" ;;
+                  *)   info "  LiteSpeed lsphp (LiteSpeed repo, not the OS php packages): ${pm:-dnf} upgrade 'lsphp*'" ;; esac
+    info "    Check the lsphp build is 8.2.35 / 8.3.36 / 8.4.27 / 8.5.12 or newer, then: /usr/local/lsws/bin/lswsctrl restart"
   fi
   if ls /etc/yum.repos.d/remi*.repo >/dev/null 2>&1 || [ -d /opt/remi ]; then
     info "  Remi: ${pm:-dnf} upgrade 'php*' (module stream) or 'php8[0-9]-*' (SCL /opt/remi). 8.2.35 / 8.3.36 / 8.4.27 / 8.5.12"
@@ -910,6 +916,15 @@ if [ "$MODE" = audit ]; then
           'eval[[:space:]]*\([[:space:]]*(base64_decode|gzinflate|gzuncompress|str_rot13|\$_(POST|GET|REQUEST|COOKIE))|(system|shell_exec|passthru|popen|proc_open|assert|pcntl_exec)[[:space:]]*\([[:space:]]*\$_(POST|GET|REQUEST|COOKIE|SERVER)' \
         | head -50)
     fi
+
+    # 2b) Disguised webshells (Elastic): double extensions (avatar.php.jpg) and images carrying PHP code
+    #     (polyglots), written within the window. Only images up to 5 MB are read.
+    while read -r f; do [ -n "$f" ] && flag "Double-extension PHP file (disguised webshell?): $f"; done < <("${NICE[@]}" find "${WEBROOTS[@]}" -xdev -type f \
+      \( -iname '*.php.*' -o -iname '*.phtml.*' -o -iname '*.phar.*' -o -iname '*.php[0-9].*' \) \
+      ! -iname '*.php.bak-[0-9]*' -mmin "-$MIN" 2>/dev/null | head -20)
+    while read -r f; do [ -n "$f" ] && flag "Image file containing PHP code (polyglot webshell?): $f"; done < <("${NICE[@]}" find "${WEBROOTS[@]}" -xdev -type f \
+      \( -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' -o -iname '*.gif' -o -iname '*.webp' -o -iname '*.ico' -o -iname '*.bmp' \) \
+      -size -5M -mmin "-$MIN" -print0 2>/dev/null | "${NICE[@]}" xargs -0 -r grep -lasE '<\?php|<\?=[[:space:]]*\$' 2>/dev/null | head -20)
 
     # 3) Per-dir config turning upload progress back on
     while read -r f; do [ -n "$f" ] && flag "Re-enables upload progress: $f"; done < <("${NICE[@]}" find "${WEBROOTS[@]}" -xdev -type f \
