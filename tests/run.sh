@@ -59,6 +59,7 @@ cp -p "$CLI_INI" /root/cli.ini.orig
 echo "== --waf-print"
 out="$(bash $S --waf-print)"; expect_rc 0 $? "waf-print"
 echo "$out" | grep -q 'SecRule ARGS_NAMES' && pass "waf-print has ModSecurity rule" || fail "waf-print content"
+echo "$out" | grep -q 'id:1026111,.*t:length' && pass "waf-print has the urlencoded OOM rule" || fail "waf-print missing urlencoded OOM rule"
 echo "$out" | sed -n '/AWS WAF/,/^$/p' | grep '^# [{ ]' | sed 's/^# //' > /tmp/aws-waf.json
 php -r 'exit(is_array(json_decode(file_get_contents("/tmp/aws-waf.json"), true)) ? 0 : 1);' && pass "waf-print AWS WAF rule is valid JSON" || fail "AWS WAF rule JSON"
 rm -f /tmp/aws-waf.json
@@ -218,6 +219,10 @@ echo '<?php echo 1;' > /tmp/dropper.php
 sh -c 'sleep 60; : /dev/tcp/203.0.113.7/4444' & RS=$!
 out="$(bash $S --audit 2>&1)"
 echo "$out" | grep -q 'worker crash line(s) in /var/log/phptest-fpm.log' && pass "audit flags worker crash" || fail "audit missed worker crash"
+echo "NOTICE: PHP message: PHP Fatal error:  Allowed memory size of 16777216 bytes exhausted (tried to allocate 3500032 bytes) in Unknown on line 0" >> /var/log/phptest-fpm.log
+echo "NOTICE: PHP message: PHP Fatal error:  Allowed memory size of 16777216 bytes exhausted (tried to allocate 20480 bytes) in /var/www/html/x.php on line 3" >> /var/log/phptest-fpm.log
+out2="$(bash $S --audit 2>&1)"
+echo "$out2" | grep -q '1 request-startup out-of-memory line(s)' && pass "audit flags request-startup OOM (only 'Unknown on line 0')" || fail "audit missed request-startup OOM"
 echo "$out" | grep -q 'PHP file in a temp directory: /tmp/dropper.php' && pass "audit flags temp-dir PHP" || fail "audit missed temp-dir PHP"
 echo "$out" | grep -q 'Reverse-shell-like process' && pass "audit flags reverse-shell command line" || fail "audit missed reverse shell"
 kill "$RS" 2>/dev/null; pkill -f '203.0.113.7' 2>/dev/null; rm -f /var/log/phptest-fpm.log /tmp/dropper.php
@@ -334,7 +339,9 @@ IMV=/etc/apache2/conf.d/modsec_vendor_configs/imunify360-full-apache
 mkdir -p "$IMV" && echo 8.82 > "$IMV/VERSION"
 bash $S --check 2>&1 | grep -q 'Imunify360 WAF rules 8.82 are older than 8.83' && pass "Imunify360 < 8.83 flagged" || fail "Imunify360 old ruleset not flagged"
 echo 8.83 > "$IMV/VERSION"
-bash $S --check 2>&1 | grep -q 'Imunify360 WAF rules 8.83 (>= 8.83' && pass "Imunify360 8.83 recognised" || fail "Imunify360 8.83 not recognised"
+bash $S --check 2>&1 | grep -q 'Imunify360 WAF rules 8.83: 8.84+' && pass "Imunify360 8.83 asks for 8.84+" || fail "Imunify360 8.83 not tiered"
+echo 8.85 > "$IMV/VERSION"
+bash $S --check 2>&1 | grep -q 'Imunify360 WAF rules 8.85 (>= 8.85' && pass "Imunify360 8.85 recognised" || fail "Imunify360 8.85 not recognised"
 rm -rf /etc/apache2/conf.d/modsec_vendor_configs; rmdir /etc/apache2/conf.d /etc/apache2 2>/dev/null
 
 echo "== --check knows the fixed versions"

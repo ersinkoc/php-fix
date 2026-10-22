@@ -20,7 +20,7 @@
 
 set -u
 
-VERSION="1.14.0"
+VERSION="1.15.0"
 DIRECTIVE="session.upload_progress.enabled"
 TS="$(date +%Y%m%d-%H%M%S)"
 MODE=fix
@@ -152,6 +152,16 @@ SecRule ARGS_NAMES "@streq PHP_SESSION_UPLOAD_PROGRESS" \
 SecRule REQUEST_HEADERS:Content-Type "@rx (?i)multipart" \
   "id:1026110,phase:1,deny,status:403,log,msg:'php2shell multipart outside allowlist',chain"
   SecRule REQUEST_FILENAME "!@rx ^/(wp-admin/async-upload\.php|wp-admin/media-new\.php)$" ""
+
+############ ModSecurity — urlencoded OOM shape (CVE-2026-109618, Datadog) ############
+# The OOM path also works WITHOUT multipart: one ~3.5 MB urlencoded field NAME, an empty-named
+# field with NUL bytes. Blocking multipart does not stop it; cap request bodies too
+# (nginx client_max_body_size 8m, Apache LimitRequestBody 8388608, raise only on upload paths).
+# SecRequestBodyLimit must be at least the body size or the rule never sees the field.
+SecRule ARGS_NAMES "@gt 1024" \
+  "id:1026111,phase:2,deny,status:403,log,t:none,t:length,msg:'php2shell oversized parameter name'"
+SecRule ARGS_NAMES|ARGS "@rx \x00" \
+  "id:1026112,phase:2,deny,status:403,log,t:none,msg:'php2shell NUL byte in a parameter'"
 
 ############ nginx — multipart only on allowlisted paths ############
 # http {} context:
@@ -757,12 +767,15 @@ if [ "$MODE" = check ]; then
     [ "$JSON" -eq 1 ] || err "Held / version-locked PHP packages will NOT be updated: $held"
   fi
 
-  # Imunify360 (cPanel / CloudLinux / Plesk): ruleset 8.83 adds a php2shell block rule on Apache
+  # Imunify360 (cPanel / CloudLinux / Plesk): 8.83 blocks the public exploit (LiteSpeed: log only),
+  # 8.84 blocks the tool signature and off-site upload-progress posts on every server, 8.85 more variants.
+  # No ruleset covers the OOM path of CVE-2026-109618.
   for f in /etc/apache2/conf.d/modsec_vendor_configs/imunify360*/VERSION /etc/httpd/conf.d/modsec_vendor_configs/imunify360*/VERSION \
            /usr/local/apache/conf/modsec_vendor_configs/imunify360*/VERSION; do
     [ -f "$f" ] && [ "$JSON" -eq 0 ] || continue
     iv="$(grep -oE '[0-9]+\.[0-9]+' "$f" | head -1)"
-    if [ -n "$iv" ] && ver_ge "$iv" 8.83; then ok "Imunify360 WAF rules $iv (>= 8.83, has the php2shell rule; interim only): $f"
+    if [ -n "$iv" ] && ver_ge "$iv" 8.85; then ok "Imunify360 WAF rules $iv (>= 8.85, php2shell rules; interim only, none for the OOM path): $f"
+    elif [ -n "$iv" ] && ver_ge "$iv" 8.83; then info "Imunify360 WAF rules $iv: 8.84+ also blocks the tool on LiteSpeed, 8.85 more variants: imunify360-agent update --force modsec-rules"
     else err "Imunify360 WAF rules ${iv:-unknown} are older than 8.83: imunify360-agent update --force modsec-rules"; fi
   done
 
@@ -1031,6 +1044,18 @@ if [ "$MODE" = audit ]; then
     kc="$(dmesg 2>/dev/null | grep -Ec 'segfault at .*(php|lsphp|httpd|apache2)')"
   fi
   [ "${kc:-0}" -gt 0 ] && flag "$kc kernel segfault record(s) for PHP / web server processes"
+
+  # 8b) Memory exhausted before any script ran ("in Unknown on line 0"): request-startup OOM, the
+  #     CVE-2026-109618 trigger (Datadog), via multipart or huge urlencoded field names. Correlate.
+  OOM_RE='Allowed memory size of [0-9]+ bytes exhausted.* in Unknown on line 0'
+  for l in /var/log/php*-fpm.log /var/log/php-fpm/*log /var/log/php*error*.log /var/log/php/*.log \
+           /opt/cpanel/ea-php*/root/usr/var/log/php-fpm.log /opt/remi/php*/root/var/log/php-fpm/*log \
+           /var/log/nginx/error.log /var/log/apache2/error*.log /var/log/httpd/error_log \
+           /usr/local/apache/logs/error_log /usr/local/lsws/logs/error.log; do
+    [ -f "$l" ] || continue
+    c="$("${NICE[@]}" tail -n 200000 "$l" 2>/dev/null | grep -Ec "$OOM_RE")"
+    [ "$c" -gt 0 ] && flag "$c request-startup out-of-memory line(s) ('in Unknown on line 0') in $l: CVE-2026-109618 attempts?"
+  done
 
   # 9) PHP dropped into temp directories (write-execute-delete droppers)
   while read -r f; do [ -n "$f" ] && flag "PHP file in a temp directory: $f"; done < <(find /tmp /var/tmp /dev/shm -maxdepth 3 -type f \

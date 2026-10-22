@@ -11,7 +11,7 @@ One-line emergency mitigation for **php2shell** (**CVE-2026-109618** / **CVE-202
 > [!WARNING]
 > **Attacks started before disclosure.** Amazon's MadPot honeypots saw the first exploitation attempt on **17 October 2026**, four days before the patch. More followed on 21 October, seen by Amazon, Cloudflare, watchTowr and VulnCheck. One attempt planted a webshell into a session file through `PHP_SESSION_UPLOAD_PROGRESS`. VulnCheck reports a weaponized CVE-2026-109618 exploit working against PHP 8.4.26 on x86-64 **with ASLR on and `display_errors=Off`**. On ARM64 only the memory leak works so far. Cloudflare counted thousands of attempts in the 10 hours before the announcement and hundreds of thousands within 2 hours after; on 22 October its CEO put the total in the millions. Amazon calls it "broadly exploited in the wild". No successful compromise has been confirmed publicly yet. CISA's KEV catalog still didn't list the CVEs on 22 October (catalog 2026.10.21).
 >
-> **Don't run public "PoCs".** watchTowr says none of the mass-sprayed ones achieve RCE: they fail, measure timing or crash the target. JFrog and AhnLab found fake repositories, including one that runs a hidden encoded payload, and fake exploits aimed at security researchers have shipped malware before. CERT-EU (SA 2026-018) and the UK NCSC advise taking internet-facing PHP offline if you can't patch now.
+> **Don't run public "PoCs".** watchTowr says none of the mass-sprayed ones achieve RCE: they fail, measure timing or crash the target. Sansec adds that the public ones don't work against a default PHP install and mostly need a local file inclusion bug in the app. That is no reason to wait: Calif's own chain worked against stock Magento, WordPress, Drupal, Joomla, Nextcloud, Laravel and Symfony. JFrog and AhnLab found fake repositories, including one that runs a hidden encoded payload, and fake exploits aimed at security researchers have shipped malware before. CERT-EU (SA 2026-018) and the UK NCSC advise taking internet-facing PHP offline if you can't patch now.
 >
 > **Investigate from 17 October, not from the disclosure date:** `--audit=exposure` covers that whole window. See [Published indicators](#published-indicators-iocs).
 
@@ -48,7 +48,7 @@ curl -fsSL https://raw.githubusercontent.com/ersinkoc/php-fix/main/install.sh | 
 Piping `main` into `sudo bash` means trusting whatever is on `main` at that moment. For production, use a release instead. Every release is built by GitHub Actions and ships with a `SHA256SUMS` file and a signed [build provenance attestation](https://docs.github.com/actions/security-for-github-actions/using-artifact-attestations):
 
 ```bash
-V=v1.14.0
+V=v1.15.0
 curl -fsSLO https://github.com/ersinkoc/php-fix/releases/download/$V/install.sh
 curl -fsSLO https://github.com/ersinkoc/php-fix/releases/download/$V/SHA256SUMS
 sha256sum -c SHA256SUMS                                      # integrity
@@ -143,6 +143,7 @@ This is a heuristic sweep, not proof either way. Every finding needs a human to 
 - Busiest POST-to-`.php` clients in the current access logs (context only)
 - If your access logs record `Content-Type` (see the logging snippets in `--waf-print`): the top multipart senders, and every **multipart request answered with 500–504**. A worker crashing under multipart is the strongest exploitation signal you can get from logs.
 - **PHP / web worker crashes** (`SIGSEGV`, `exited on signal 11`, kernel `segfault at … php-fpm`) in FPM and Apache logs and the kernel log. Memory-corruption exploits usually crash workers while they are being tuned.
+- **Request-startup out-of-memory errors**: `Allowed memory size of … bytes exhausted … in Unknown on line 0` in FPM, PHP, nginx and Apache error logs. "Unknown on line 0" means memory ran out while PHP was parsing the request, before any script ran. That is the CVE-2026-109618 trigger ([Datadog](https://securitylabs.datadoghq.com/articles/php2shell-critical-vulnerabilities-in-php/)). Ordinary OOMs inside scripts are not counted.
 - PHP files dropped in `/tmp`, `/var/tmp` or `/dev/shm`
 - Reverse-shell command lines on any process (`/dev/tcp/`, `mkfifo … nc`, `nc -e`, `bash -i`, `socat … exec`, `fsockopen`, `pty.spawn`)
 - Shells or interpreters running as a web user (`www-data`, `apache`, `nginx`, `nobody`, …) and detached from their parent (double-forked)
@@ -207,11 +208,11 @@ The tests cover:
 - **Fixed versions:** `--check` classifies real distro PHP as PATCHED / UNPATCHED / EOL (Debian trixie ships 8.4.27; Ubuntu 24.04's backported 8.3.6 is detected from its changelog)
 - **`--interim`:** reads the interim settings from live FPM pools (including `opcache.enable`), flags a PHP process started with `RLIMIT_AS` (`prlimit --as`) and an Apache `RLimitMEM`, and exits 0 on a clean host
 - **cPanel EA4:** an ea-php74 package at release 19 is PATCHED, and an older release says `upgrade 'ea-php*'` (Debian / Ubuntu images, with a stub .deb)
-- **DirectAdmin:** a 7.4 binary built after CustomBuild's CVE patch is PATCHED, and an older one says `da build php`. Imunify360 rulesets older than 8.83 are flagged
+- **DirectAdmin:** a 7.4 binary built after CustomBuild's CVE patch is PATCHED, and an older one says `da build php`. Imunify360 rulesets older than 8.83 are flagged, 8.83–8.84 asked to update, 8.85 accepted
 - **Ubuntu:** `--check` recognizes 24.04's `8.3.6-0ubuntu0.24.04.13` as fixed from the USN table, and reports a build older than the table entry as unpatched
 - **After an update:** `--check` reports FPM workers still running a replaced binary, prints update and restart hints, and stops reporting once FPM is restarted. It warns about `memory_limit = -1` left on a patched FPM, but not on CLI, where `-1` is the default
 - **`--audit` and `--check`:**
-  - `--audit` flags a planted webshell, a worker `SIGSEGV` log line, a PHP file in `/tmp`, a reverse-shell command line, and a multipart request answered with `502` in a `Content-Type`-logging access log
+  - `--audit` flags a planted webshell, a worker `SIGSEGV` log line, a request-startup OOM (`in Unknown on line 0`, while an ordinary in-script OOM is ignored), a PHP file in `/tmp`, a reverse-shell command line, and a multipart request answered with `502` in a `Content-Type`-logging access log
   - `--audit` flags an image polyglot (`GIF89a<?php`) and an `avatar.php.jpg`, and leaves a clean image alone
   - `--audit` finds a published IOC address and a `php://filter` read-back in a **rotated, gzipped** access log, reports a `php2shell-scan` user agent, and flags a session file carrying a `PWNED::` webshell. `--audit=exposure` computes the window back to 17 Oct
   - `--audit` output stays clean when file names carry terminal escapes (ESC, 8-bit and UTF-8 C1)
@@ -305,6 +306,7 @@ This changes hour by hour. Check the vendor's page, then confirm with `--check`.
 | **Docker `php` image** | inside the image | ✅ `8.2.35`, `8.3.36`, `8.4.27`, `8.5.12` tags on Docker Hub (from 21 Oct, ~17:30 UTC). `*RC1` tags don't contain the fix | `docker build --pull`, then `docker compose up -d --force-recreate`. Check with `docker run --rm php:8.4-fpm php -v` |
 | Gentoo / Arch / Homebrew / windows.php.net | — | ✅ (Arch: 8.3, 8.5 only) | package manager / download |
 | FrankenPHP, Chainguard images, Bref, Heroku | — | ✅ (FrankenPHP v1.13.2) | update the binary / image / buildpack |
+| Aikido images (`public.ecr.aws/aikido-dev/php`) | inside the image | ✅ free backported images that keep the old tag, e.g. `php:8.4.26-fpm-trixie`, `php:8.3.35-cli`, `php:7.4.33-fpm`, `php:7.3.33-fpm`. No 8.0 / 8.1 yet | for pinned old tags you can't move yet. The version string stays old, so `php -v` and `--check` can't prove the fix: trust the vendor or move to 8.x.y fixed tags |
 | **Fedora** | — | ✅ 44: PHP 8.5.12 (FEDORA-2026-a9eba4bbc3) | `dnf upgrade --refresh 'php*'` |
 | SUSE / openSUSE | — | ⏳ no advisory found on 22 Oct. SUSE backports at the same version number | `zypper lp --cve=CVE-2026-109618`, then `zypper patch` |
 | **Local dev stacks**: MAMP, XAMPP, Laragon, static-php-cli, NativePHP, swoole-cli, ServBay macOS v2 | — | ❌ not fixed (21 Oct). ✅ Laravel Herd, ServBay v1 | don't expose them to the internet; XAMPP hasn't shipped since 2023 |
@@ -377,6 +379,7 @@ The OOM bug is reached mainly through PHP's multipart parser, and no PHP setting
 - **CDN / WAF:** it only protects traffic that goes through it. Restrict the origin to the CDN's IP ranges, or direct-to-IP requests skip it.
 - **Log `Content-Type`.** Default access logs don't record it, so multipart probing is invisible. `--waf-print` includes nginx `log_format` and Apache `LogFormat` snippets, and `--audit` uses them.
 - **Know what you'll break:** file uploads, `FormData`/AJAX forms, Contact Form 7 (multipart even without files) and Livewire/Filament uploads stop working outside the allowlist.
+- **Multipart is not the only way in.** Datadog reached the OOM path with a plain `application/x-www-form-urlencoded` POST: one field name of about 3.5 MB, plus an empty-named field holding NUL bytes. A multipart block doesn't stop that. Cap request bodies too (nginx `client_max_body_size 8m`, Apache `LimitRequestBody 8388608`, larger only on upload paths). `--waf-print` adds ModSecurity rules for parameter names over 1 KB and NUL bytes in parameters. Your WAF body-inspection limit (`SecRequestBodyLimit`) must be at least that large, or the rule never sees the field.
 - The narrow ModSecurity rule, which blocks only the `PHP_SESSION_UPLOAD_PROGRESS` field, is safe for almost every site. ModSecurity's multipart parser isn't PHP's, though, so treat it as a filter, not a guarantee.
 
 To check from outside that your edge really rejects multipart, test against a PHP file, not `/`:
@@ -474,7 +477,7 @@ php-fix closes config paths and reports patch status. It doesn't watch traffic o
 | Tool | Where it helps | Getting started |
 |---|---|---|
 | **Cloudflare WAF** | Blocks known php2shell exploit traffic at the edge. Free plans included (Managed Free Ruleset) | Make sure the managed rules are on (paid plans: Cloudflare Managed Ruleset in block mode). Review hits under Security → Events. Allow only [Cloudflare IPs](https://www.cloudflare.com/ips/) to reach the origin, or attackers can go around it |
-| **Imunify360** (cPanel, Plesk, DirectAdmin, CloudLinux) | ModSecurity vendor rules with a php2shell rule (8.83+); scanning IPs get a CAPTCHA | `imunify360-agent update --force modsec-rules`; `--check` reports the installed ruleset version. On LiteSpeed it only logs |
+| **Imunify360** (cPanel, Plesk, DirectAdmin, CloudLinux) | ModSecurity vendor rules: 8.83 blocks the public exploit, 8.84 the tool signature and off-site upload-progress posts (LiteSpeed too), 8.85 more variants. No rule covers the OOM path. Scanning IPs get a CAPTCHA | `imunify360-agent update --force modsec-rules`. `--check` reports the ruleset version and asks for 8.85 or later. Off-site upload forms and stripped `Referer` headers can trip 8.84 |
 | **ImunifyAV** (free) / **Linux Malware Detect** / **ClamAV** | Finding webshells and droppers after the fact | ImunifyAV: install from the panel's plugin page. maldet: `maldet -a /var/www`. ClamAV: `clamscan -ri /var/www` |
 | **ModSecurity + OWASP CRS** | Generic web attack rules on your own Apache / nginx. Not php2shell-specific | Debian / Ubuntu Apache: `apt install libapache2-mod-security2 modsecurity-crs`, then copy `/etc/modsecurity/modsecurity.conf-recommended` to `modsecurity.conf`. Start in `DetectionOnly`, watch the audit log for false positives, then switch to `SecRuleEngine On` |
 | **CrowdSec** | Reads web server logs, bans abusive IPs, and shares a blocklist | Install from [crowdsec.net](https://docs.crowdsec.net/), add the nginx or apache2 collection (`cscli collections install crowdsecurity/nginx`) and a firewall bouncer. Check the hub for PHP-related scenarios: `cscli hub update && cscli scenarios list -a \| grep -i php` |
@@ -549,6 +552,7 @@ Timeline note: the fix and advisories are public, so the patch diff now shows at
 - [Assessing and containing php2shell: DeXpose](https://www.dexpose.io/php2shell-php-rce-exposure-response/)
 - [Apache-level multipart blocking toolkit: syhunt/php2shell-protection](https://github.com/syhunt/php2shell-protection)
 - [Sansec: Critical PHP RCE](https://sansec.io/research/php2shell)
+- [Aikido: patched images and exposure checker](https://www.aikido.dev/blog/critical-vulnerabilities-in-php-php2shell)
 - [Huntress: Rapid Response, php2shell](https://www.huntress.com/blog/php2shell-leaked-critical-php-vulnerabilities)
 - [Vincent Schmalbach: what you should do now](https://www.vincentschmalbach.com/cve-2026-109618-and-cve-2026-109619-what-you-should-do-now/)
 - [Amazon Threat Intelligence: exploitation before disclosure in MadPot (17 Oct)](https://aws.amazon.com/blogs/security/amazon-threat-intelligence-identifies-php2shell-exploitation-prior-to-public-disclosure-in-madpot/)
