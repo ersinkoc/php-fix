@@ -17,6 +17,9 @@ One-line emergency mitigation for **php2shell** (**CVE-2026-109618** / **CVE-202
 
 It sets `session.upload_progress.enabled = Off` across every PHP installation on a Linux server: distro packages, control panels, multiple PHP versions, PHP-FPM pools and Apache mod_php. On **unpatched PHP 8.5** it also sets `fatal_error_backtraces = Off`. Then it verifies the result through the CLI and FPM binaries and every running FPM pool. Read-only modes check patch status against the fixed versions (`--check`), sweep for signs of compromise (`--audit`) and print WAF rules for the multipart path (`--waf-print`).
 
+> [!NOTE]
+> **A third CVE, same mitigation.** On 23 October 2026 the PHP team disclosed **[CVE-2026-115560](https://thehackernews.com/2026/10/urgent-php-warns-of-another-unpatched.html)**, another unpatched session-handling RCE ([CERT-EU SA 2026-018 v1.2](https://cert.europa.eu/publications/security-advisories/2026-018) lists all three). The recommended mitigation is again `session.upload_progress.enabled=0` with a worker restart, so **this script already covers it** — and it writes the setting with `php_admin_flag`, the robust form both PHP and CERT-EU ask for (not `ini_set()` or `.user.ini`). The bug is narrow: it needs an app that sets `session.serialize_handler` to `php_binary` / `php_serialize` in config, then switches it back to `php` with `ini_set()` before `session_start()`, with upload progress still on. No exploitation reported; the fix lands in the next regular release. If you already ran the fix, you need nothing more.
+
 ## What the two bugs are (from the official advisories)
 
 | | [CVE-2026-109618](https://github.com/php/php-src/security/advisories/GHSA-w8hw-w9fx-j79w): RCE via OOM corruption | [CVE-2026-109619](https://github.com/php/php-src/security/advisories/GHSA-6wmf-4rv5-p3rp): RCE via stale global state |
@@ -558,6 +561,8 @@ Timeline note: the fix and advisories are public, so the patch diff now shows at
 - [GHSA-w8hw-w9fx-j79w / CVE-2026-109618: RCE via OOM corruption](https://github.com/php/php-src/security/advisories/GHSA-w8hw-w9fx-j79w)
 - [GHSA-6wmf-4rv5-p3rp / CVE-2026-109619: RCE via stale global state](https://github.com/php/php-src/security/advisories/GHSA-6wmf-4rv5-p3rp)
 - [Help Net Security: PHP2Shell patched](https://www.helpnetsecurity.com/2026/10/21/php2shell-php-vulnerabilities-patched-cve-2026-109618-cve-2026-109619/)
+- [CERT-EU SA 2026-018 (v1.2, covers CVE-2026-109618 / 109619 / 115560)](https://cert.europa.eu/publications/security-advisories/2026-018)
+- [The Hacker News: PHP warns of CVE-2026-115560](https://thehackernews.com/2026/10/urgent-php-warns-of-another-unpatched.html)
 - [Tenable FAQ](https://www.tenable.com/blog/php2shell-cve-2026-109618-cve-2026-109619-frequently-asked-questions-about-critical-php-remote)
 - [Plesk advisory](https://support.plesk.com/hc/en-us/articles/44397729587351-Vulnerability-CVE-2026-109618-and-CVE-2026-109619-Remote-code-execution-in-PHP-shipped-with-Plesk)
 - [Ubuntu: php2shell fixes available (USN-8948-1 / USN-8948-2)](https://ubuntu.com/blog/php2shell-vulnerability-fixes-available)
