@@ -51,7 +51,7 @@ curl -fsSL https://raw.githubusercontent.com/ersinkoc/php-fix/main/install.sh | 
 Piping `main` into `sudo bash` means trusting whatever is on `main` at that moment. For production, use a release instead. Every release is built by GitHub Actions and ships with a `SHA256SUMS` file and a signed [build provenance attestation](https://docs.github.com/actions/security-for-github-actions/using-artifact-attestations):
 
 ```bash
-V=v1.19.0
+V=v1.19.1
 curl -fsSLO https://github.com/ersinkoc/php-fix/releases/download/$V/install.sh
 curl -fsSLO https://github.com/ersinkoc/php-fix/releases/download/$V/SHA256SUMS
 sha256sum -c SHA256SUMS                                      # integrity
@@ -171,6 +171,7 @@ From [Amazon Threat Intelligence](https://aws.amazon.com/blogs/security/amazon-t
 | `38.180.45.91` (`B8RAT/1.0`), `80.66.66.66`, `217.60.242.76`, `87.192.237.19` (manual `curl`) | Other upload-progress dialects, 21–22 Oct (OffSeq) |
 | `34.19.34.88`, `34.76.232.95`, `34.76.218.47` (Google Cloud, `fasthttp`), `194.42.196.44` | Memory-pressure bodies: 1 MB `wafjunk` field of `A`s from 20 Oct 21:57 UTC, and a 2 MB WordPress REST batch on 18 Oct (OffSeq) |
 | Boundary `----p2shell<24 hex>`, user agent `B8RAT/1.0` | Attack tools tagging themselves. `--audit` flags them in access logs (the boundary only if `Content-Type` is logged), `--waf-print` blocks them |
+| `206.188.197.105`; `MARKER_<8 hex>.txt` upload names; session-id prefixes `fprint` / `dp` | [SOCRadar](https://socradar.io/blog/php2shell-cve-2026-109618-cve-2026-109619/) (23 Oct) names this staging / operations server and the filenames its screening probes write. `--audit` flags the IP in access logs |
 | Field names `f0[k0][k1]…[k59]` … `f9[…]`, up to ~580 bracket pairs; upload-progress value `\|x\|i:1;` | Request shapes of the lead tool and the serialized-data variant. `--waf-print` blocks names nested 20+ levels deep |
 | A size sweep: upload-progress POSTs from one source with growing bodies | An attacker tuning the out-of-memory point. Log the request length (`$request_length` / `%I`) to see it |
 | `PHP_SESSION_UPLOAD_PROGRESS` field in a multipart body | The upload-progress path. Needs body logging or a WAF to see it. OffSeq saw it **zero** times in the six weeks before 20 Oct, so on most sites any hit is an attack |
@@ -360,7 +361,7 @@ php-fix can't reach PHP inside a vendor appliance or a closed product. Follow th
 |---|---|
 | **Palo Alto Networks** | ❌ **PAN-OS and Panorama, all versions affected, no fixed release yet.** Threat Prevention signatures 543004, 97622–97625 (21 Oct). Keep management interfaces off the internet. Cloud NGFW, Prisma Access, Cortex XDR agent / XSOAR / Xpanse are not affected |
 | **Fortinet** | ⏳ FG-IR-26-186: nothing confirmed affected. FortiADC, FortiClient EMS, FortiDDoS, FortiSIEM, FortiSOAR, FortiMonitor and others under investigation. FortiOS, FortiManager, FortiAnalyzer, FortiWeb, FortiMail not affected |
-| **Cisco** | ⏳ cisco-sa-php-october26-Jj384Daq: ISE, Catalyst Center, SD-WAN Manager, Expressway, AppDynamics PHP Agent and others under investigation |
+| **Cisco** | ⏳ cisco-sa-php-october26-Jj384Daq: ISE, Catalyst Center, SD-WAN Manager, Expressway, AppDynamics PHP Agent and others under investigation. Snort rules 67359 / 67360 for Expressway ([SOCRadar](https://socradar.io/blog/php2shell-cve-2026-109618-cve-2026-109619/), 23 Oct) |
 
 Inventory everything that serves HTTP and may embed PHP (NAS boxes, panels, monitoring, helpdesk and VPN appliances), not only your own servers.
 
